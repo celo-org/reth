@@ -1,5 +1,5 @@
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{BlockNumber, B256};
+use alloy_primitives::BlockNumber;
 use alloy_rlp::Decodable;
 use reth_codecs::Compact;
 use reth_node_builder::NodePrimitives;
@@ -36,7 +36,7 @@ where
 pub fn setup_without_evm<Provider, F>(
     provider_rw: &Provider,
     header: SealedHeader<<Provider::Primitives as NodePrimitives>::BlockHeader>,
-    header_factory: F,
+    _header_factory: F,
 ) -> ProviderResult<()>
 where
     Provider: StaticFileProviderFactory
@@ -50,8 +50,7 @@ where
     info!(target: "reth::cli", new_tip = ?header.num_hash(), "Setting up dummy EVM chain before importing state.");
 
     let static_file_provider = provider_rw.static_file_provider();
-    // Write EVM dummy data up to `header - 1` block
-    append_dummy_chain(&static_file_provider, header.number() - 1, header_factory)?;
+    advance_segments_to_height(&static_file_provider, header.number() - 1)?;
 
     info!(target: "reth::cli", "Appending first valid block.");
 
@@ -94,25 +93,19 @@ where
     Ok(())
 }
 
-/// Creates a dummy chain with no transactions/receipts up to `target_height` block inclusive.
+/// Advances all static file segments to `target_height` without writing any block data.
 ///
-/// * Headers: It will push an empty block.
-/// * Transactions: It will not push any tx, only increments the end block range.
-/// * Receipts: It will not push any receipt, only increments the end block range.
-/// * TransactionSenders: If the segment exists, increments the end block range.
-fn append_dummy_chain<N, F>(
+/// Sets the block range on each segment's header directly rather than iterating
+/// through every block. This is O(1) instead of O(target_height).
+fn advance_segments_to_height<N>(
     sf_provider: &StaticFileProvider<N>,
     target_height: BlockNumber,
-    header_factory: F,
 ) -> ProviderResult<()>
 where
     N: NodePrimitives,
-    F: Fn(BlockNumber) -> N::BlockHeader + Send + Sync + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    // Spawn jobs for incrementing the block end range of transactions, receipts, and senders.
     for segment in [
+        StaticFileSegment::Headers,
         StaticFileSegment::Transactions,
         StaticFileSegment::Receipts,
         StaticFileSegment::TransactionSenders,
@@ -120,55 +113,15 @@ where
         if sf_provider.get_highest_static_file_block(segment).is_none() {
             continue
         }
-        let tx_clone = tx.clone();
-        let provider = sf_provider.clone();
-        let thread_name = match segment {
-            StaticFileSegment::Transactions => "init-state-txs",
-            StaticFileSegment::Receipts => "init-state-receipts",
-            StaticFileSegment::TransactionSenders => "init-state-senders",
-            _ => "init-state-segment",
-        };
-        reth_tasks::spawn_os_thread(thread_name, move || {
-            let result = provider.latest_writer(segment).and_then(|mut writer| {
-                for block_num in 1..=target_height {
-                    writer.increment_block(block_num)?;
-                }
-                Ok(())
-            });
-
-            tx_clone.send(result).unwrap();
-        });
+        let mut writer = sf_provider.latest_writer(segment)?;
+        writer.user_header_mut().set_block_range(0, target_height);
+        writer.commit()?;
     }
 
-    // Spawn job for appending empty headers
-    let provider = sf_provider.clone();
-    reth_tasks::spawn_os_thread("init-state-headers", move || {
-        let result = provider.latest_writer(StaticFileSegment::Headers).and_then(|mut writer| {
-            for block_num in 1..=target_height {
-                // TODO: should we fill with real parent_hash?
-                let header = header_factory(block_num);
-                writer.append_header(&header, &B256::ZERO)?;
-            }
-            Ok(())
-        });
-
-        tx.send(result).unwrap();
-    });
-
-    // Catches any StaticFileWriter error.
-    while let Ok(append_result) = rx.recv() {
-        if let Err(err) = append_result {
-            tracing::error!(target: "reth::cli", "Error appending dummy chain: {err}");
-            return Err(err)
-        }
-    }
-
-    // If, for any reason, rayon crashes this verifies if all segments are at the same
-    // target_height.
     for segment in [
         StaticFileSegment::Headers,
-        StaticFileSegment::Receipts,
         StaticFileSegment::Transactions,
+        StaticFileSegment::Receipts,
         StaticFileSegment::TransactionSenders,
     ] {
         if sf_provider.get_highest_static_file_block(segment).is_none() {
