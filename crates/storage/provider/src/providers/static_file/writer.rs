@@ -818,6 +818,48 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.writer.user_header().block_end()
     }
 
+    /// Advances the writer to `target_block` by filling and creating segment files
+    /// at each file boundary. O(number of files) instead of O(target_block).
+    ///
+    /// No data is written — only block ranges are set. Intended for creating empty
+    /// dummy chains where intermediate blocks have no content.
+    pub fn advance_to_block(&mut self, target_block: BlockNumber) -> ProviderResult<()> {
+        let segment = self.writer.user_header().segment();
+
+        loop {
+            let expected_start = self.writer.user_header().expected_block_start();
+            let expected_end = self.writer.user_header().expected_block_end();
+            if expected_end >= target_block {
+                self.writer.user_header_mut().set_block_range(expected_start, target_block);
+                break;
+            }
+
+            self.writer.user_header_mut().set_block_range(expected_start, expected_end);
+            self.commit()?;
+
+            let (writer, data_path) =
+                Self::open(segment, expected_end + 1, self.reader.clone(), self.metrics.clone())?;
+            self.writer = writer;
+            self.data_path = data_path.clone();
+
+            if segment.is_change_based() {
+                let csoff_path = data_path.with_extension("csoff");
+                self.changeset_offsets = Some(
+                    ChangesetOffsetWriter::new(&csoff_path, 0).map_err(ProviderError::other)?,
+                );
+            }
+
+            *self.writer.user_header_mut() = SegmentHeader::new(
+                self.reader().find_fixed_range(segment, expected_end + 1),
+                None,
+                None,
+                segment,
+            );
+        }
+
+        Ok(())
+    }
+
     /// Returns a block number that is one next to the current tip of static files.
     pub fn next_block_number(&self) -> u64 {
         // The next static file block number can be found by checking the one after block_end.
