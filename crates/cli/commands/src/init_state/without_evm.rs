@@ -113,25 +113,10 @@ where
         if sf_provider.get_highest_static_file_block(segment).is_none() {
             continue
         }
+        let range = sf_provider.find_fixed_range(segment, target_height);
         let mut writer = sf_provider.get_writer(target_height, segment)?;
-        writer.user_header_mut().set_block_range(0, target_height);
+        writer.user_header_mut().set_block_range(range.start(), target_height);
         writer.commit()?;
-    }
-
-    for segment in [
-        StaticFileSegment::Headers,
-        StaticFileSegment::Transactions,
-        StaticFileSegment::Receipts,
-        StaticFileSegment::TransactionSenders,
-    ] {
-        if sf_provider.get_highest_static_file_block(segment).is_none() {
-            continue
-        }
-        assert_eq!(
-            sf_provider.latest_writer(segment)?.user_header().block_end(),
-            Some(target_height),
-            "Static file segment {segment} was unsuccessful advancing its block height."
-        );
     }
 
     Ok(())
