@@ -113,7 +113,7 @@ where
         if sf_provider.get_highest_static_file_block(segment).is_none() {
             continue
         }
-        let mut writer = sf_provider.latest_writer(segment)?;
+        let mut writer = sf_provider.get_writer(target_height, segment)?;
         writer.user_header_mut().set_block_range(0, target_height);
         writer.commit()?;
     }
