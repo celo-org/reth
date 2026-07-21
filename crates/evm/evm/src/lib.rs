@@ -18,14 +18,14 @@
 extern crate alloc;
 
 use crate::execute::{BasicBlockBuilder, Executor};
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     precompiles::PrecompilesMap,
 };
 use alloy_primitives::{Address, Bytes, B256};
-use core::{error::Error, fmt::Debug};
+use core::{any::Any, error::Error, fmt::Debug};
 use execute::{BasicBlockExecutor, BlockAssembler, BlockBuilder};
 use reth_execution_errors::BlockExecutionError;
 use reth_primitives_traits::{
@@ -333,6 +333,39 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         I: InspectorFor<Self, DB>,
     {
         self.evm_factory().create_evm_with_inspector(db, evm_env, inspector)
+    }
+
+    /// Captures implementation-defined block-scoped context from block-start state, for seeding
+    /// EVMs that simulate transactions at a mid-block position of that block via
+    /// [`ConfigureEvm::seed_block_replay_ctx`].
+    ///
+    /// EVM implementations may carry block-scoped state that is initialized once per block from
+    /// the first state the EVM observes (e.g. per-block exchange rates read from an on-chain
+    /// source). A call simulated at a mid-block position (`debug_traceCall` with a transaction
+    /// index, `debug_traceCallMany`) runs on an EVM created over mid-block state, which would
+    /// re-initialize such context from the wrong state. Implementations can capture the context
+    /// here (invoked on the block-start state, before the block's transaction prefix is
+    /// replayed) and re-apply it in [`ConfigureEvm::seed_block_replay_ctx`].
+    ///
+    /// The default implementation captures nothing.
+    fn capture_block_replay_ctx<DB: Database>(
+        &self,
+        _db: &mut DB,
+        _evm_env: &EvmEnvFor<Self>,
+    ) -> Option<Box<dyn Any + Send>> {
+        None
+    }
+
+    /// Seeds an EVM that simulates transactions at a mid-block position of a block with the
+    /// block-scoped context captured by [`ConfigureEvm::capture_block_replay_ctx`] at that
+    /// block's start.
+    ///
+    /// The default implementation does nothing.
+    fn seed_block_replay_ctx<DB, I>(&self, _evm: &mut EvmFor<Self, DB, I>, _ctx: &(dyn Any + Send))
+    where
+        DB: Database,
+        I: InspectorFor<Self, DB>,
+    {
     }
 
     /// Creates a strategy with given EVM and execution context.

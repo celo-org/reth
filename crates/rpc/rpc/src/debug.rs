@@ -347,19 +347,30 @@ where
 
         self.eth_api()
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
-                // 1. replay the required number of transactions
-                eth_api.replay_block_until(&mut db, &block, tx_index)?;
+                // 1. replay the required number of transactions, capturing block-scoped EVM
+                //    context from block-start state on the way, so the traced call sees the same
+                //    context a transaction included in this block would
+                let replay_ctx =
+                    eth_api.replay_block_until_capturing_ctx(&mut db, &block, tx_index, true)?;
 
                 // 2. now execute the trace call on this state
                 let (evm_env, tx_env) =
                     eth_api.prepare_call_env(evm_env, call, &mut db, overrides)?;
 
-                let mut inspector =
+                let inspector =
                     DebugInspector::new(tracing_options).map_err(Eth::Error::from_eth_err)?;
-                let res =
-                    eth_api.inspect(&mut db, evm_env.clone(), tx_env.clone(), &mut inspector)?;
+                let mut evm = eth_api.evm_config().evm_with_env_and_inspector(
+                    &mut db,
+                    evm_env.clone(),
+                    inspector,
+                );
+                if let Some(ctx) = &replay_ctx {
+                    eth_api.evm_config().seed_block_replay_ctx(&mut evm, &**ctx);
+                }
+                let res = evm.transact(tx_env.clone()).map_err(Eth::Error::from_evm_err)?;
+                let (db, inspector, _) = evm.components_mut();
                 let trace = inspector
-                    .get_result(None, &tx_env, &evm_env.block_env, &res, &mut db)
+                    .get_result(None, &tx_env, &evm_env.block_env, &res, &mut **db)
                     .map_err(Eth::Error::from_eth_err)?;
 
                 Ok(trace)
@@ -416,11 +427,16 @@ where
                 // the outer vec for the bundles
                 let mut all_bundles = Vec::with_capacity(bundles.len());
 
+                let mut replay_ctx = None;
                 if replay_block_txs {
                     // only need to replay the transactions in the block if not all transactions are
                     // to be replayed
-                    // Execute all transactions until index
-                    eth_api.replay_block_until(&mut db, &block, num_txs)?;
+                    //
+                    // Execute all transactions until index, capturing block-scoped EVM context
+                    // from block-start state, so bundle calls simulated at a mid-block position
+                    // see the same context a transaction included in this block would
+                    replay_ctx =
+                        eth_api.replay_block_until_capturing_ctx(&mut db, &block, num_txs, true)?;
                 }
 
                 // Trace all bundles
@@ -442,12 +458,16 @@ where
                         let (evm_env, tx_env) =
                             eth_api.prepare_call_env(evm_env.clone(), tx, &mut db, overrides)?;
 
-                        let res = eth_api.inspect(
+                        let mut evm = eth_api.evm_config().evm_with_env_and_inspector(
                             &mut db,
                             evm_env.clone(),
-                            tx_env.clone(),
                             &mut inspector,
-                        )?;
+                        );
+                        if let Some(ctx) = &replay_ctx {
+                            eth_api.evm_config().seed_block_replay_ctx(&mut evm, &**ctx);
+                        }
+                        let res = evm.transact(tx_env.clone()).map_err(Eth::Error::from_evm_err)?;
+                        drop(evm);
                         let trace = inspector
                             .get_result(None, &tx_env, &evm_env.block_env, &res, &mut db)
                             .map_err(Eth::Error::from_eth_err)?;
