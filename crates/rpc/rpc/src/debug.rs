@@ -123,17 +123,22 @@ where
                 eth_api.apply_pre_execution_changes(&block, &mut db)?;
 
                 let mut transactions = block.transactions_recovered().enumerate().peekable();
-                let mut inspector = DebugInspector::new(opts).map_err(Eth::Error::from_eth_err)?;
+                let inspector = DebugInspector::new(opts).map_err(Eth::Error::from_eth_err)?;
+                // Replay all transactions on a single EVM, like the block executor and the
+                // `trace_*` API do: EVM implementations may carry block-scoped state initialized
+                // from the first state they observe, so a fresh EVM per transaction would
+                // re-initialize that state mid-block.
+                let mut evm = eth_api.evm_config().evm_with_env_and_inspector(
+                    &mut db,
+                    evm_env.clone(),
+                    inspector,
+                );
                 while let Some((index, tx)) = transactions.next() {
                     let tx_hash = *tx.tx_hash();
                     let tx_env = eth_api.evm_config().tx_env(tx);
 
-                    let res = eth_api.inspect(
-                        &mut db,
-                        evm_env.clone(),
-                        tx_env.clone(),
-                        &mut inspector,
-                    )?;
+                    let res = evm.transact(tx_env.clone()).map_err(Eth::Error::from_evm_err)?;
+                    let (db, inspector, _) = evm.components_mut();
                     let result = inspector
                         .get_result(
                             Some(TransactionContext {
@@ -144,7 +149,7 @@ where
                             &tx_env,
                             &evm_env.block_env,
                             &res,
-                            &mut db,
+                            &mut **db,
                         )
                         .map_err(Eth::Error::from_eth_err)?;
 
@@ -239,19 +244,33 @@ where
 
                 eth_api.apply_pre_execution_changes(&block, &mut db)?;
 
-                // replay all transactions prior to the targeted transaction
-                let index = eth_api.replay_transactions_until(
+                let inspector = DebugInspector::new(opts).map_err(Eth::Error::from_eth_err)?;
+                // Replay the prior transactions and trace the target on the same EVM, so that
+                // EVM-internal block-scoped state matches what block execution produced.
+                let mut evm = eth_api.evm_config().evm_with_env_and_inspector(
                     &mut db,
                     evm_env.clone(),
-                    block_txs,
-                    *tx.tx_hash(),
-                )?;
+                    inspector,
+                );
+
+                // replay all transactions prior to the targeted transaction without tracing them
+                evm.disable_inspector();
+                let mut index = 0;
+                for prior_tx in block_txs {
+                    if *prior_tx.tx_hash() == *tx.tx_hash() {
+                        // reached the target transaction
+                        break
+                    }
+                    let prior_tx_env = eth_api.evm_config().tx_env(prior_tx);
+                    evm.transact_commit(prior_tx_env).map_err(Eth::Error::from_evm_err)?;
+                    index += 1;
+                }
+                evm.enable_inspector();
 
                 let tx_env = eth_api.evm_config().tx_env(&tx);
 
-                let mut inspector = DebugInspector::new(opts).map_err(Eth::Error::from_eth_err)?;
-                let res =
-                    eth_api.inspect(&mut db, evm_env.clone(), tx_env.clone(), &mut inspector)?;
+                let res = evm.transact(tx_env.clone()).map_err(Eth::Error::from_evm_err)?;
+                let (db, inspector, _) = evm.components_mut();
                 let trace = inspector
                     .get_result(
                         Some(TransactionContext {
@@ -262,7 +281,7 @@ where
                         &tx_env,
                         &evm_env.block_env,
                         &res,
-                        &mut db,
+                        &mut **db,
                     )
                     .map_err(Eth::Error::from_eth_err)?;
 
@@ -440,11 +459,12 @@ where
 
                     let transactions = block.transactions_recovered().take(num_txs);
 
-                    // Execute all transactions until index
+                    // Execute all transactions until index, on a single EVM so that EVM-internal
+                    // block-scoped state is carried across transactions
+                    let mut evm = eth_api.evm_config().evm_with_env(&mut db, evm_env.clone());
                     for tx in transactions {
                         let tx_env = eth_api.evm_config().tx_env(tx);
-                        let res = eth_api.transact(&mut db, evm_env.clone(), tx_env)?;
-                        db.commit(res.state);
+                        evm.transact_commit(tx_env).map_err(Eth::Error::from_evm_err)?;
                     }
                 }
 
@@ -722,12 +742,14 @@ where
                 eth_api.apply_pre_execution_changes(&block, &mut db)?;
 
                 let mut roots = Vec::with_capacity(block.body().transactions().len());
+                // Execute the whole block on a single EVM so that EVM-internal block-scoped
+                // state is carried across transactions
+                let mut evm = eth_api.evm_config().evm_with_env(&mut db, evm_env);
                 for tx in block.transactions_recovered() {
                     let tx_env = eth_api.evm_config().tx_env(tx);
-                    {
-                        let mut evm = eth_api.evm_config().evm_with_env(&mut db, evm_env.clone());
-                        evm.transact_commit(tx_env).map_err(Eth::Error::from_evm_err)?;
-                    }
+                    evm.transact_commit(tx_env).map_err(Eth::Error::from_evm_err)?;
+
+                    let db = evm.db_mut();
                     // Merge transitions into cumulative bundle_state
                     db.merge_transitions(BundleRetention::PlainState);
                     // Compute state root from the accumulated state changes
