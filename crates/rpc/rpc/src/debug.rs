@@ -379,8 +379,15 @@ where
                 eth_api.apply_pre_execution_changes(&block, &mut db)?;
 
                 // capture block-scoped EVM context from block-start state, so the traced call
-                // sees the same context a transaction included in this block would
-                let replay_ctx = eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
+                // sees the same context a transaction included in this block would. Explicit
+                // state overrides opt out: the caller diverged from canonical state, so the
+                // context is loaded from the overridden state instead, matching the
+                // non-tx-index path.
+                let replay_ctx = if overrides.has_state() {
+                    None
+                } else {
+                    eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env)
+                };
 
                 // 2. replay the required number of transactions
                 eth_api.replay_transactions_until(
@@ -472,8 +479,13 @@ where
 
                     // capture block-scoped EVM context from block-start state, so bundle calls
                     // simulated at a mid-block position see the same context a transaction
-                    // included in this block would
-                    replay_ctx = eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
+                    // included in this block would. Explicit state overrides opt out: the
+                    // caller diverged from canonical state, so the context is loaded from the
+                    // overridden state instead.
+                    if state_overrides.is_none() {
+                        replay_ctx =
+                            eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
+                    }
 
                     let transactions = block.transactions_recovered().take(num_txs);
 
