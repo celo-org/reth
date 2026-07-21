@@ -349,9 +349,15 @@ where
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
                 // 1. replay the required number of transactions, capturing block-scoped EVM
                 //    context from block-start state on the way, so the traced call sees the same
-                //    context a transaction included in this block would
-                let replay_ctx =
-                    eth_api.replay_block_until_capturing_ctx(&mut db, &block, tx_index, true)?;
+                //    context a transaction included in this block would. Explicit state
+                //    overrides opt out: the caller diverged from canonical state, so the context
+                //    is loaded from the overridden state instead, matching the non-tx-index path.
+                let replay_ctx = eth_api.replay_block_until_capturing_ctx(
+                    &mut db,
+                    &block,
+                    tx_index,
+                    !overrides.has_state(),
+                )?;
 
                 // 2. now execute the trace call on this state
                 let (evm_env, tx_env) =
@@ -434,9 +440,15 @@ where
                     //
                     // Execute all transactions until index, capturing block-scoped EVM context
                     // from block-start state, so bundle calls simulated at a mid-block position
-                    // see the same context a transaction included in this block would
-                    replay_ctx =
-                        eth_api.replay_block_until_capturing_ctx(&mut db, &block, num_txs, true)?;
+                    // see the same context a transaction included in this block would. Explicit
+                    // state overrides opt out: the caller diverged from canonical state, so the
+                    // context is loaded from the overridden state instead.
+                    replay_ctx = eth_api.replay_block_until_capturing_ctx(
+                        &mut db,
+                        &block,
+                        num_txs,
+                        state_overrides.is_none(),
+                    )?;
                 }
 
                 // Trace all bundles
