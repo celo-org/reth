@@ -16,7 +16,7 @@ use reth_rpc_eth_types::cache::db::StateCacheDb;
 use reth_storage_api::{ProviderBlock, ProviderTx};
 use revm::{context::Block, context_interface::result::ResultAndState};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 /// Executes CPU heavy tasks.
 pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
@@ -135,15 +135,41 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
         block: &RecoveredBlock<BlockTy<Self::Primitives>>,
         target_tx_index: usize,
     ) -> Result<(), Self::Error> {
+        self.replay_block_until_capturing_ctx(db, block, target_tx_index, false).map(drop)
+    }
+
+    /// Same as [`Trace::replay_block_until`], but additionally captures the implementation-defined
+    /// block-scoped EVM context via [`ConfigureEvm::capture_block_replay_ctx`].
+    ///
+    /// The capture happens on the block-start state, i.e. after the block's pre-execution changes
+    /// have been applied and before any of the block's transactions is replayed, so that calls
+    /// simulated at a mid-block position can be seeded with it through
+    /// [`ConfigureEvm::seed_block_replay_ctx`].
+    ///
+    /// Pass `capture = false` to skip the capture and only replay; the returned context is then
+    /// always `None`.
+    fn replay_block_until_capturing_ctx(
+        &self,
+        db: &mut StateCacheDb,
+        block: &RecoveredBlock<BlockTy<Self::Primitives>>,
+        target_tx_index: usize,
+        capture: bool,
+    ) -> Result<Option<Box<dyn Any + Send>>, Self::Error> {
         self.apply_pre_execution_changes(block, db)?;
 
         let evm_env = self.evm_env_for_header(block.sealed_block().sealed_header())?;
+        // capture before the prefix is replayed, so the context reflects block-start state
+        let replay_ctx =
+            capture.then(|| self.evm_config().capture_block_replay_ctx(db, &evm_env)).flatten();
+
         let mut evm = self.evm_config().evm_with_env(db, evm_env);
         self.replay_transactions_until_with_evm(
             &mut evm,
             block.transactions_recovered(),
             target_tx_index,
-        )
+        )?;
+
+        Ok(replay_ctx)
     }
 
     /// Replays all transactions before the target transaction without inspection, then executes
