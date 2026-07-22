@@ -1292,3 +1292,225 @@ impl<B: BlockTrait> Default for BadBlockStore<B> {
         Self::new(64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EthApi, EthApiBuilder};
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_network::Ethereum;
+    use alloy_primitives::{Signature, TxKind};
+    use alloy_rpc_types_eth::{state::StateOverride, TransactionIndex, TransactionRequest};
+    use reth_chainspec::ChainSpec;
+    use reth_ethereum_primitives::{EthPrimitives, Transaction, TransactionSigned};
+    use reth_evm::{ConfigureEvm, EvmEnvFor, EvmFor, ExecutionCtxFor, InspectorFor};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_primitives_traits::SealedBlock;
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_rpc_convert::RpcConverter;
+    use reth_rpc_eth_api::node::RpcNodeCoreAdapter;
+    use reth_rpc_eth_types::receipt::EthReceiptConverter;
+    use reth_transaction_pool::test_utils::{testing_pool, TestPool};
+    use std::{
+        any::Any,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    /// Marker context returned by [`CountingEvmConfig::capture_block_replay_ctx`].
+    struct CapturedCtx;
+
+    /// An [`EthEvmConfig`] wrapper counting block replay context captures and seeds.
+    #[derive(Debug, Clone)]
+    struct CountingEvmConfig {
+        inner: EthEvmConfig,
+        captures: Arc<AtomicUsize>,
+        seeds: Arc<AtomicUsize>,
+    }
+
+    impl ConfigureEvm for CountingEvmConfig {
+        type Primitives = <EthEvmConfig as ConfigureEvm>::Primitives;
+        type Error = <EthEvmConfig as ConfigureEvm>::Error;
+        type NextBlockEnvCtx = <EthEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
+        type BlockExecutorFactory = <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory;
+        type BlockAssembler = <EthEvmConfig as ConfigureEvm>::BlockAssembler;
+
+        fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
+            self.inner.block_executor_factory()
+        }
+
+        fn block_assembler(&self) -> &Self::BlockAssembler {
+            self.inner.block_assembler()
+        }
+
+        fn evm_env(&self, header: &Header) -> Result<EvmEnvFor<Self>, Self::Error> {
+            self.inner.evm_env(header)
+        }
+
+        fn next_evm_env(
+            &self,
+            parent: &Header,
+            attributes: &Self::NextBlockEnvCtx,
+        ) -> Result<EvmEnvFor<Self>, Self::Error> {
+            self.inner.next_evm_env(parent, attributes)
+        }
+
+        fn context_for_block<'a>(
+            &self,
+            block: &'a SealedBlock<reth_ethereum_primitives::Block>,
+        ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+            self.inner.context_for_block(block)
+        }
+
+        fn context_for_next_block(
+            &self,
+            parent: &reth_primitives_traits::SealedHeader,
+            attributes: Self::NextBlockEnvCtx,
+        ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
+            self.inner.context_for_next_block(parent, attributes)
+        }
+
+        fn capture_block_replay_ctx<DB: reth_evm::Database>(
+            &self,
+            _db: &mut DB,
+            _evm_env: &EvmEnvFor<Self>,
+        ) -> Option<Box<dyn Any + Send>> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(CapturedCtx))
+        }
+
+        fn seed_block_replay_ctx<DB, I>(
+            &self,
+            _evm: &mut EvmFor<Self, DB, I>,
+            ctx: &(dyn Any + Send),
+        ) where
+            DB: reth_evm::Database,
+            I: InspectorFor<Self, DB>,
+        {
+            assert!(ctx.downcast_ref::<CapturedCtx>().is_some());
+            self.seeds.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    type CountingEthApi = EthApi<
+        RpcNodeCoreAdapter<MockEthProvider, TestPool, NoopNetwork, CountingEvmConfig>,
+        RpcConverter<Ethereum, CountingEvmConfig, EthReceiptConverter<ChainSpec>>,
+    >;
+
+    /// Builds a [`DebugApi`] over a mock one-transaction block at height 1, returning the
+    /// capture and seed counters and the block hash.
+    fn counting_debug_api() -> (DebugApi<CountingEthApi>, Arc<AtomicUsize>, Arc<AtomicUsize>, B256)
+    {
+        let provider = MockEthProvider::default();
+
+        let parent = Header { number: 0, gas_limit: 30_000_000, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+        let tx = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy {
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::ZERO),
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        let block = reth_ethereum_primitives::Block {
+            header: Header { number: 1, parent_hash, gas_limit: 30_000_000, ..Default::default() },
+            body: alloy_consensus::BlockBody { transactions: vec![tx], ..Default::default() },
+        };
+        let block_hash = block.header.hash_slow();
+        provider.add_header(parent_hash, parent);
+        provider.add_block(block_hash, block);
+
+        let captures = Arc::new(AtomicUsize::new(0));
+        let seeds = Arc::new(AtomicUsize::new(0));
+        let evm_config = CountingEvmConfig {
+            inner: EthEvmConfig::new(provider.chain_spec()),
+            captures: captures.clone(),
+            seeds: seeds.clone(),
+        };
+        let eth_api =
+            EthApiBuilder::new(provider, testing_pool(), NoopNetwork::default(), evm_config)
+                .build();
+        let debug_api = DebugApi::new(
+            eth_api,
+            BlockingTaskGuard::new(5),
+            &Runtime::test(),
+            futures::stream::empty::<ConsensusEngineEvent<EthPrimitives>>(),
+        );
+        (debug_api, captures, seeds, block_hash)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_at_tx_index_seeds_block_start_context() {
+        let (api, captures, seeds, block_hash) = counting_debug_api();
+
+        let opts = GethDebugTracingCallOptions { tx_index: Some(0), ..Default::default() };
+        api.debug_trace_call(TransactionRequest::default(), Some(block_hash.into()), opts)
+            .await
+            .unwrap();
+
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(seeds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_at_tx_index_skips_capture_with_state_overrides() {
+        let (api, captures, seeds, block_hash) = counting_debug_api();
+
+        let opts = GethDebugTracingCallOptions {
+            tx_index: Some(0),
+            state_overrides: Some(StateOverride::default()),
+            ..Default::default()
+        };
+        api.debug_trace_call(TransactionRequest::default(), Some(block_hash.into()), opts)
+            .await
+            .unwrap();
+
+        assert_eq!(captures.load(Ordering::SeqCst), 0);
+        assert_eq!(seeds.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_captures_context_per_bundle() {
+        let (api, captures, seeds, block_hash) = counting_debug_api();
+
+        let bundles = vec![
+            Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
+            Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
+        ];
+        let context = StateContext {
+            block_number: Some(block_hash.into()),
+            transaction_index: Some(TransactionIndex::Index(0)),
+        };
+        api.debug_trace_call_many(bundles, Some(context), None).await.unwrap();
+
+        // one capture at block start plus one re-capture for the second bundle, each
+        // seeding its bundle's transaction
+        assert_eq!(captures.load(Ordering::SeqCst), 2);
+        assert_eq!(seeds.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_skips_first_capture_with_state_overrides() {
+        let (api, captures, seeds, block_hash) = counting_debug_api();
+
+        let bundles = vec![
+            Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
+            Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
+        ];
+        let context = StateContext {
+            block_number: Some(block_hash.into()),
+            transaction_index: Some(TransactionIndex::Index(0)),
+        };
+        let opts = GethDebugTracingCallOptions {
+            state_overrides: Some(StateOverride::default()),
+            ..Default::default()
+        };
+        api.debug_trace_call_many(bundles, Some(context), Some(opts)).await.unwrap();
+
+        // the overridden first bundle loads context from its state; only the second
+        // bundle re-captures (from state that already includes the overrides)
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(seeds.load(Ordering::SeqCst), 1);
+    }
+}
