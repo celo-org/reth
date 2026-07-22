@@ -674,18 +674,23 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + Send + Sync + 'static> BlockRe
 
     fn recovered_block(
         &self,
-        _id: BlockHashOrNumber,
-        _transaction_kind: TransactionVariant,
+        id: BlockHashOrNumber,
+        transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        Ok(None)
+        self.sealed_block_with_senders(id, transaction_kind)
     }
 
     fn sealed_block_with_senders(
         &self,
-        _id: BlockHashOrNumber,
+        id: BlockHashOrNumber,
         _transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        Ok(None)
+        let Some(block) = self.block(id)? else { return Ok(None) };
+        let senders =
+            block.body().recover_signers().map_err(|_| ProviderError::SenderRecoveryError)?;
+        // The hash is recomputed from the header, so it only matches the store key if the
+        // block was inserted under its actual hash.
+        Ok(Some(RecoveredBlock::new_unhashed(block, senders)))
     }
 
     fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Self::Block>> {
