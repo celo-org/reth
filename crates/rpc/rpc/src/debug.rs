@@ -352,6 +352,12 @@ where
                 //    context a transaction included in this block would. Explicit state
                 //    overrides opt out: the caller diverged from canonical state, so the context
                 //    is loaded from the overridden state instead, matching the non-tx-index path.
+                //
+                //    Unlike debug_trace_transaction, the traced call cannot share the replay EVM:
+                //    the call runs under a caller-modified env (prepare_call_env applies the
+                //    request and overrides) and an EVM's env cannot be swapped after
+                //    construction, so the call gets a fresh EVM and the block-start context is
+                //    transplanted via capture/seed.
                 let replay_ctx = eth_api.replay_block_until_capturing_ctx(
                     &mut db,
                     &block,
