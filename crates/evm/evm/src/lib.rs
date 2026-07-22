@@ -360,6 +360,11 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     /// block-scoped context captured by [`ConfigureEvm::capture_block_replay_ctx`] at that
     /// block's start.
     ///
+    /// Implementations should downcast `ctx` to the concrete type they returned from
+    /// [`ConfigureEvm::capture_block_replay_ctx`] and ignore a failed downcast rather than
+    /// panic: the EVM then initializes its context from the state it runs on, which is the
+    /// pre-seeding behavior.
+    ///
     /// The default implementation does nothing.
     fn seed_block_replay_ctx<DB, I>(&self, _evm: &mut EvmFor<Self, DB, I>, _ctx: &(dyn Any + Send))
     where
