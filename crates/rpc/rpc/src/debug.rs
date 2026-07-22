@@ -496,13 +496,29 @@ where
                         let tx_env = eth_api.evm_config().tx_env(tx);
                         evm.transact_commit(tx_env).map_err(Eth::Error::from_evm_err)?;
                     }
+                } else if state_overrides.is_none() {
+                    // No prefix replay: the first bundle simulates on top of the block's final
+                    // state, so its block-scoped context is captured from that state. The
+                    // state-override opt-out applies as above.
+                    replay_ctx = eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
                 }
 
                 // Trace all bundles
                 let mut bundles = bundles.into_iter().peekable();
+                let mut first_bundle = true;
                 let mut inspector = DebugInspector::new(tracing_options.clone())
                     .map_err(Eth::Error::from_eth_err)?;
                 while let Some(bundle) = bundles.next() {
+                    // Every bundle simulates a block of its own, and each transaction of a
+                    // bundle must see the context from that simulated block's start: re-capture
+                    // for follow-up bundles from the state the previous bundle committed (any
+                    // state overrides are already part of that state).
+                    if !first_bundle {
+                        replay_ctx =
+                            eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
+                    }
+                    first_bundle = false;
+
                     let mut results = Vec::with_capacity(bundle.transactions.len());
                     let Bundle { transactions, block_override } = bundle;
 
