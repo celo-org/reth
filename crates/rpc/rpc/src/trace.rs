@@ -1,6 +1,9 @@
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockId;
-use alloy_evm::block::calc::{base_block_reward_pre_merge, block_reward, ommer_reward};
+use alloy_evm::{
+    block::calc::{base_block_reward_pre_merge, block_reward, ommer_reward},
+    Evm,
+};
 use alloy_primitives::{
     map::{HashMap, HashSet},
     Address, BlockHash, Bytes, B256, U256,
@@ -24,7 +27,7 @@ use reth_rpc_api::TraceApiServer;
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
     helpers::{Call, LoadPendingBlock, LoadTransaction, Trace, TraceExt},
-    FromEthApiError, RpcNodeCore,
+    FromEthApiError, FromEvmError, RpcNodeCore,
 };
 use reth_rpc_eth_types::{error::EthApiError, utils::recover_raw_transaction, EthConfig};
 use reth_storage_api::{BlockNumReader, BlockReader};
@@ -152,6 +155,11 @@ where
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
                 let mut results = Vec::with_capacity(calls.len());
+                let replay_ctx = if calls.is_empty() {
+                    None
+                } else {
+                    eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env)
+                };
                 let mut calls = calls.into_iter().peekable();
 
                 while let Some((call, trace_types)) = calls.next() {
@@ -163,7 +171,16 @@ where
                     )?;
                     let config = TracingInspectorConfig::from_parity_config(&trace_types);
                     let mut inspector = TracingInspector::new(config);
-                    let res = eth_api.inspect(&mut db, evm_env, tx_env, &mut inspector)?;
+                    let mut evm = eth_api.evm_config().evm_with_env_and_inspector(
+                        &mut db,
+                        evm_env,
+                        &mut inspector,
+                    );
+                    if let Some(ctx) = &replay_ctx {
+                        eth_api.evm_config().seed_block_replay_ctx(&mut evm, &**ctx);
+                    }
+                    let res = evm.transact(tx_env).map_err(Eth::Error::from_evm_err)?;
+                    drop(evm);
 
                     let trace_res = inspector
                         .into_parity_builder()
@@ -780,6 +797,132 @@ struct TraceApiInner<Eth> {
     blocking_task_guard: BlockingTaskGuard,
     // eth config settings
     eth_config: EthConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EthApiBuilder;
+    use alloy_consensus::{BlockBody, Header};
+    use alloy_rpc_types_eth::TransactionRequest;
+    use reth_ethereum_primitives::Block;
+    use reth_evm::{EvmEnvFor, EvmFor, ExecutionCtxFor, InspectorFor};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_primitives_traits::SealedBlock;
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_transaction_pool::test_utils::testing_pool;
+    use std::{
+        any::Any,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
+
+    #[derive(Debug)]
+    struct CapturedCtx(usize);
+
+    #[derive(Debug, Clone)]
+    struct CountingEvmConfig {
+        inner: EthEvmConfig,
+        captures: Arc<AtomicUsize>,
+        seeds: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl ConfigureEvm for CountingEvmConfig {
+        type Primitives = <EthEvmConfig as ConfigureEvm>::Primitives;
+        type Error = <EthEvmConfig as ConfigureEvm>::Error;
+        type NextBlockEnvCtx = <EthEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
+        type BlockExecutorFactory = <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory;
+        type BlockAssembler = <EthEvmConfig as ConfigureEvm>::BlockAssembler;
+
+        fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
+            self.inner.block_executor_factory()
+        }
+
+        fn block_assembler(&self) -> &Self::BlockAssembler {
+            self.inner.block_assembler()
+        }
+
+        fn evm_env(&self, header: &Header) -> Result<EvmEnvFor<Self>, Self::Error> {
+            self.inner.evm_env(header)
+        }
+
+        fn next_evm_env(
+            &self,
+            parent: &Header,
+            attributes: &Self::NextBlockEnvCtx,
+        ) -> Result<EvmEnvFor<Self>, Self::Error> {
+            self.inner.next_evm_env(parent, attributes)
+        }
+
+        fn context_for_block<'a>(
+            &self,
+            block: &'a SealedBlock<Block>,
+        ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+            self.inner.context_for_block(block)
+        }
+
+        fn context_for_next_block(
+            &self,
+            parent: &reth_primitives_traits::SealedHeader,
+            attributes: Self::NextBlockEnvCtx,
+        ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
+            self.inner.context_for_next_block(parent, attributes)
+        }
+
+        fn capture_block_replay_ctx<DB: reth_evm::Database>(
+            &self,
+            _db: &mut DB,
+            _evm_env: &EvmEnvFor<Self>,
+        ) -> Option<Box<dyn Any + Send>> {
+            Some(Box::new(CapturedCtx(self.captures.fetch_add(1, Ordering::SeqCst))))
+        }
+
+        fn seed_block_replay_ctx<DB, I>(
+            &self,
+            _evm: &mut EvmFor<Self, DB, I>,
+            ctx: &(dyn Any + Send),
+        ) where
+            DB: reth_evm::Database,
+            I: InspectorFor<Self, DB>,
+        {
+            let ctx = ctx.downcast_ref::<CapturedCtx>().expect("captured context type");
+            self.seeds.lock().unwrap().push(ctx.0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_reuses_sequence_start_context() {
+        let provider = MockEthProvider::default();
+        let header = Header { number: 1, gas_limit: 30_000_000, ..Default::default() };
+        let block_hash = header.hash_slow();
+        provider.add_block(block_hash, Block { header, body: BlockBody::default() });
+
+        let captures = Arc::new(AtomicUsize::new(0));
+        let seeds = Arc::new(Mutex::new(Vec::new()));
+        let evm_config = CountingEvmConfig {
+            inner: EthEvmConfig::new(provider.chain_spec()),
+            captures: captures.clone(),
+            seeds: seeds.clone(),
+        };
+        let eth_api =
+            EthApiBuilder::new(provider, testing_pool(), NoopNetwork::default(), evm_config)
+                .build();
+        let api = TraceApi::new(eth_api, BlockingTaskGuard::new(1), EthConfig::default());
+        let mut trace_types = HashSet::default();
+        trace_types.insert(TraceType::Trace);
+        let calls = vec![
+            (TransactionRequest::default(), trace_types.clone()),
+            (TransactionRequest::default(), trace_types),
+        ];
+
+        api.trace_call_many(calls, Some(block_hash.into())).await.unwrap();
+
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(*seeds.lock().unwrap(), vec![0, 0]);
+    }
 }
 
 /// Response type for storage tracing that contains all accessed storage slots
