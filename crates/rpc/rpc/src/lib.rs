@@ -35,6 +35,8 @@ mod net;
 mod otterscan;
 mod reth;
 mod rpc;
+#[cfg(test)]
+mod test_utils;
 mod testing;
 mod trace;
 mod txpool;
