@@ -319,6 +319,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let StateContext { transaction_index, block_number } =
                 state_context.unwrap_or_default();
             let transaction_index = transaction_index.unwrap_or_default();
+            state_override = state_override.filter(|overrides| !overrides.is_empty());
 
             let mut target_block = block_number.unwrap_or_default();
             let is_block_target_pending = target_block.is_pending();
@@ -381,17 +382,37 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     }
 
                     let mut bundle_results = Vec::with_capacity(transactions.len());
-                    let block_overrides = block_override.map(Box::new);
+                    let mut bundle_evm_env = evm_env.clone();
+                    if let Some(block_override) = block_override {
+                        apply_block_overrides(
+                            block_override,
+                            &mut db,
+                            bundle_evm_env.block_env.inner_mut(),
+                        );
+                    }
+                    if let Some(state_override) = state_override.take() {
+                        apply_state_overrides(state_override, &mut db)
+                            .map_err(EthApiError::from_state_overrides_err)
+                            .map_err(|err| {
+                                Self::Error::from_eth_err(EthApiError::call_many_error(
+                                    bundle_index,
+                                    0,
+                                    err.into(),
+                                ))
+                            })?;
+                    }
+                    let replay_ctx =
+                        this.evm_config().capture_block_replay_ctx(&mut db, &bundle_evm_env);
 
                     // transact all transactions in the bundle
                     for (tx_index, tx) in transactions.into_iter().enumerate() {
-                        // Apply overrides, state overrides are only applied for the first tx in the
-                        // request
-                        let overrides =
-                            EvmOverrides::new(state_override.take(), block_overrides.clone());
-
                         let (current_evm_env, prepared_tx) = this
-                            .prepare_call_env(evm_env.clone(), tx, &mut db, overrides)
+                            .prepare_call_env(
+                                bundle_evm_env.clone(),
+                                tx,
+                                &mut db,
+                                EvmOverrides::default(),
+                            )
                             .map_err(|err| {
                                 Self::Error::from_eth_err(EthApiError::call_many_error(
                                     bundle_index,
@@ -399,15 +420,21 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                                     err.into(),
                                 ))
                             })?;
-                        let res = this.transact(&mut db, current_evm_env, prepared_tx).map_err(
-                            |err| {
+                        let mut evm = this.evm_config().evm_with_env(&mut db, current_evm_env);
+                        if let Some(ctx) = &replay_ctx {
+                            this.evm_config().seed_block_replay_ctx(&mut evm, &**ctx);
+                        }
+                        let res = evm
+                            .transact(prepared_tx)
+                            .map_err(Self::Error::from_evm_err)
+                            .map_err(|err| {
                                 Self::Error::from_eth_err(EthApiError::call_many_error(
                                     bundle_index,
                                     tx_index,
                                     err.into(),
                                 ))
-                            },
-                        )?;
+                            })?;
+                        drop(evm);
 
                         match Self::Error::ensure_success(res.result) {
                             Ok(output) => {

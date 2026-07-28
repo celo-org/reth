@@ -561,12 +561,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{eth::helpers::types::EthRpcConverter, EthApi, EthApiBuilder};
+    use crate::{
+        eth::helpers::types::EthRpcConverter,
+        test_utils::{ReplayContextRecorder, CONTEXT_MARKER},
+        EthApi, EthApiBuilder,
+    };
     use alloy_consensus::{Block, BlockBody, Header};
     use alloy_eips::BlockNumberOrTag;
-    use alloy_primitives::{Signature, B256, U64};
+    use alloy_primitives::{Signature, B256, U256, U64};
     use alloy_rpc_types::FeeHistory;
-    use alloy_rpc_types_eth::{Bundle, TransactionRequest};
+    use alloy_rpc_types_eth::{
+        state::StateOverridesBuilder, BlockOverrides, Bundle, StateContext, TransactionRequest,
+    };
     use jsonrpsee_types::error::INVALID_PARAMS_CODE;
     use rand::Rng;
     use reth_chain_state::CanonStateSubscriptions;
@@ -575,7 +581,7 @@ mod tests {
     use reth_evm_ethereum::EthEvmConfig;
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::{
-        test_utils::{MockEthProvider, NoopProvider},
+        test_utils::{ExtendedAccount, MockEthProvider, NoopProvider},
         StageCheckpointReader,
     };
     use reth_rpc_eth_api::{node::RpcNodeCoreAdapter, EthApiServer};
@@ -809,6 +815,62 @@ mod tests {
         assert!(
             message.contains("block not found"),
             "missing block hash should still map to block-not-found: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_many_captures_context_after_bundle_overrides() {
+        let provider = MockEthProvider::default().with_recovered_blocks();
+        provider.add_account(CONTEXT_MARKER, ExtendedAccount::new(0, U256::from(1)));
+
+        let header = Header { number: 1, gas_limit: 30_000_000, ..Default::default() };
+        let block_hash = header.hash_slow();
+        provider.add_block(block_hash, Block { header, body: BlockBody::default() });
+
+        let recorder = ReplayContextRecorder::default();
+        let evm_config = recorder.evm_config(EthEvmConfig::new(provider.chain_spec()));
+        let eth_api =
+            EthApiBuilder::new(provider, testing_pool(), NoopNetwork::default(), evm_config)
+                .build();
+
+        let bundles = vec![
+            Bundle {
+                transactions: vec![TransactionRequest::default(), TransactionRequest::default()],
+                block_override: Some(BlockOverrides {
+                    number: Some(U256::from(10)),
+                    ..Default::default()
+                }),
+            },
+            Bundle {
+                transactions: vec![TransactionRequest::default(), TransactionRequest::default()],
+                block_override: Some(BlockOverrides {
+                    number: Some(U256::from(20)),
+                    ..Default::default()
+                }),
+            },
+        ];
+        let state_context =
+            StateContext { block_number: Some(block_hash.into()), transaction_index: None };
+        let state_override =
+            StateOverridesBuilder::default().with_balance(CONTEXT_MARKER, U256::from(7)).build();
+
+        <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api,
+            bundles,
+            Some(state_context),
+            Some(state_override),
+        )
+        .await
+        .unwrap();
+
+        let captures = recorder.captures();
+        assert_eq!(
+            captures.iter().map(|ctx| (ctx.marker_balance, ctx.block_number)).collect::<Vec<_>>(),
+            vec![(Some(U256::from(7)), U256::from(10)), (Some(U256::from(7)), U256::from(20)),]
+        );
+        assert_eq!(
+            recorder.seeds().into_iter().map(|ctx| ctx.id).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1]
         );
     }
 
