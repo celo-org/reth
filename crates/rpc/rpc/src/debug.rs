@@ -255,16 +255,11 @@ where
 
                 // replay all transactions prior to the targeted transaction without tracing them
                 evm.disable_inspector();
-                let mut index = 0;
-                for prior_tx in block_txs {
-                    if *prior_tx.tx_hash() == *tx.tx_hash() {
-                        // reached the target transaction
-                        break
-                    }
-                    let prior_tx_env = eth_api.evm_config().tx_env(prior_tx);
-                    evm.transact_commit(prior_tx_env).map_err(Eth::Error::from_evm_err)?;
-                    index += 1;
-                }
+                let index = eth_api.replay_transactions_until_with_evm(
+                    &mut evm,
+                    block_txs,
+                    *tx.tx_hash(),
+                )?;
                 evm.enable_inspector();
 
                 let tx_env = eth_api.evm_config().tx_env(&tx);
@@ -1439,7 +1434,7 @@ mod tests {
     /// capture and seed counters and the block hash.
     fn counting_debug_api() -> (DebugApi<CountingEthApi>, Arc<AtomicUsize>, Arc<AtomicUsize>, B256)
     {
-        let provider = MockEthProvider::default();
+        let provider = MockEthProvider::default().with_recovered_blocks();
 
         let parent = Header { number: 0, gas_limit: 30_000_000, ..Default::default() };
         let parent_hash = parent.hash_slow();
@@ -1550,5 +1545,274 @@ mod tests {
         // bundle re-captures (from state that already includes the overrides)
         assert_eq!(captures.load(Ordering::SeqCst), 1);
         assert_eq!(seeds.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod stateful_replay_tests {
+    use super::*;
+    use crate::{EthApi, EthApiBuilder};
+    use alloy_consensus::{BlockBody, Header, TxLegacy};
+    use alloy_evm::{
+        eth::EthEvmContext, precompiles::PrecompilesMap, Database, EthEvm, EvmEnv, EvmFactory,
+    };
+    use alloy_network::Ethereum;
+    use alloy_primitives::{address, Signature, TxKind, U256};
+    use reth_chainspec::ChainSpec;
+    use reth_ethereum_primitives::{EthPrimitives, Transaction, TransactionSigned};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_rpc_convert::RpcConverter;
+    use reth_rpc_eth_api::{helpers::Trace, node::RpcNodeCoreAdapter};
+    use reth_rpc_eth_types::receipt::EthReceiptConverter;
+    use reth_transaction_pool::test_utils::{testing_pool, TestPool};
+    use revm::{
+        context::{
+            result::{EVMError, HaltReason, ResultAndState},
+            BlockEnv, CfgEnv, TxEnv,
+        },
+        inspector::NoOpInspector,
+        primitives::hardfork::SpecId,
+        Inspector,
+    };
+    use revm_inspectors::tracing::TracingInspectorConfig;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    const WRITER: Address = address!("00000000000000000000000000000000000000aa");
+    const OBSERVED_SLOT: U256 = U256::ZERO;
+    const BLOCK_START_VALUE: u64 = 1;
+    const WRITTEN_VALUE: u64 = 2;
+
+    #[derive(Debug, Default, Clone)]
+    struct EvmObservations {
+        values: Arc<Mutex<Vec<U256>>>,
+        evms_created: Arc<AtomicUsize>,
+    }
+
+    impl EvmObservations {
+        fn take_values(&self) -> Vec<U256> {
+            std::mem::take(&mut *self.values.lock().unwrap())
+        }
+
+        fn take_evms_created(&self) -> usize {
+            self.evms_created.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    /// Test EVM carrying a value loaded from state on its first transaction in each block.
+    struct StatefulEthEvm<DB: Database, I> {
+        inner: EthEvm<DB, I, PrecompilesMap>,
+        cached: Option<(U256, U256)>,
+        observations: EvmObservations,
+    }
+
+    impl<DB, I> Evm for StatefulEthEvm<DB, I>
+    where
+        DB: Database,
+        I: Inspector<EthEvmContext<DB>>,
+    {
+        type DB = DB;
+        type Tx = TxEnv;
+        type Error = EVMError<DB::Error>;
+        type HaltReason = HaltReason;
+        type Spec = SpecId;
+        type BlockEnv = BlockEnv;
+        type Precompiles = PrecompilesMap;
+        type Inspector = I;
+
+        fn transact_raw(
+            &mut self,
+            tx: Self::Tx,
+        ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
+            let block_number = self.inner.block().number;
+            if self.cached.map(|(number, _)| number) != Some(block_number) {
+                let value = self
+                    .inner
+                    .db_mut()
+                    .storage(WRITER, OBSERVED_SLOT)
+                    .map_err(EVMError::Database)?;
+                self.cached = Some((block_number, value));
+            }
+            self.observations.values.lock().unwrap().push(self.cached.expect("just loaded").1);
+            self.inner.transact_raw(tx)
+        }
+
+        fn transact_system_call(
+            &mut self,
+            caller: Address,
+            contract: Address,
+            data: Bytes,
+        ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
+            self.inner.transact_system_call(caller, contract, data)
+        }
+
+        fn block(&self) -> &Self::BlockEnv {
+            self.inner.block()
+        }
+
+        fn cfg_env(&self) -> &CfgEnv<Self::Spec> {
+            self.inner.cfg_env()
+        }
+
+        fn chain_id(&self) -> u64 {
+            self.inner.chain_id()
+        }
+
+        fn finish(self) -> (Self::DB, EvmEnv<Self::Spec, Self::BlockEnv>) {
+            self.inner.finish()
+        }
+
+        fn set_inspector_enabled(&mut self, enabled: bool) {
+            self.inner.set_inspector_enabled(enabled)
+        }
+
+        fn components(&self) -> (&Self::DB, &Self::Inspector, &Self::Precompiles) {
+            self.inner.components()
+        }
+
+        fn components_mut(
+            &mut self,
+        ) -> (&mut Self::DB, &mut Self::Inspector, &mut Self::Precompiles) {
+            self.inner.components_mut()
+        }
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct StatefulEvmFactory {
+        observations: EvmObservations,
+    }
+
+    impl EvmFactory for StatefulEvmFactory {
+        type Evm<DB: Database, I: Inspector<EthEvmContext<DB>>> = StatefulEthEvm<DB, I>;
+        type Context<DB: Database> = EthEvmContext<DB>;
+        type Tx = TxEnv;
+        type Error<DBError: core::error::Error + Send + Sync + 'static> = EVMError<DBError>;
+        type HaltReason = HaltReason;
+        type Spec = SpecId;
+        type BlockEnv = BlockEnv;
+        type Precompiles = PrecompilesMap;
+
+        fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
+            self.observations.evms_created.fetch_add(1, Ordering::Relaxed);
+            StatefulEthEvm {
+                inner: alloy_evm::EthEvmFactory::default().create_evm(db, input),
+                cached: None,
+                observations: self.observations.clone(),
+            }
+        }
+
+        fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
+            &self,
+            db: DB,
+            input: EvmEnv,
+            inspector: I,
+        ) -> Self::Evm<DB, I> {
+            self.observations.evms_created.fetch_add(1, Ordering::Relaxed);
+            StatefulEthEvm {
+                inner: alloy_evm::EthEvmFactory::default()
+                    .create_evm_with_inspector(db, input, inspector),
+                cached: None,
+                observations: self.observations.clone(),
+            }
+        }
+    }
+
+    type StatefulEvmConfig = EthEvmConfig<ChainSpec, StatefulEvmFactory>;
+    type StatefulEthApi = EthApi<
+        RpcNodeCoreAdapter<MockEthProvider, TestPool, NoopNetwork, StatefulEvmConfig>,
+        RpcConverter<Ethereum, StatefulEvmConfig, EthReceiptConverter<ChainSpec>>,
+    >;
+
+    struct Fixture {
+        api: DebugApi<StatefulEthApi>,
+        observations: EvmObservations,
+        tx_hashes: Vec<B256>,
+    }
+
+    fn fixture(tx_count: usize) -> Fixture {
+        let provider = MockEthProvider::default().with_recovered_blocks();
+        provider.add_account(
+            WRITER,
+            ExtendedAccount::new(0, U256::ZERO)
+                .with_bytecode(Bytes::from(vec![0x60, WRITTEN_VALUE as u8, 0x60, 0x00, 0x55, 0x00]))
+                .extend_storage([(B256::ZERO, U256::from(BLOCK_START_VALUE))]),
+        );
+
+        let transactions: Vec<_> = (0..tx_count)
+            .map(|i| {
+                let (to, gas_limit) = if i == 0 {
+                    (TxKind::Call(WRITER), 100_000)
+                } else {
+                    (TxKind::Call(Address::ZERO), 21_000 + i as u64)
+                };
+                TransactionSigned::new_unhashed(
+                    Transaction::Legacy(TxLegacy {
+                        gas_limit,
+                        gas_price: 0,
+                        to,
+                        ..Default::default()
+                    }),
+                    Signature::test_signature(),
+                )
+            })
+            .collect();
+        let tx_hashes = transactions.iter().map(|tx| *tx.tx_hash()).collect();
+
+        let parent = Header { number: 0, gas_limit: 30_000_000, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+        let block = reth_ethereum_primitives::Block {
+            header: Header { number: 1, parent_hash, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody { transactions, ..Default::default() },
+        };
+        let block_hash = block.header.hash_slow();
+        provider.add_header(parent_hash, parent);
+        provider.add_block(block_hash, block);
+
+        let observations = EvmObservations::default();
+        let evm_config = EthEvmConfig::new_with_evm_factory(
+            provider.chain_spec(),
+            StatefulEvmFactory { observations: observations.clone() },
+        );
+        let eth_api =
+            EthApiBuilder::new(provider, testing_pool(), NoopNetwork::default(), evm_config)
+                .build();
+        let api = DebugApi::new(
+            eth_api,
+            BlockingTaskGuard::new(1),
+            &Runtime::test(),
+            futures::stream::empty::<ConsensusEngineEvent<EthPrimitives>>(),
+        );
+
+        observations.take_values();
+        observations.take_evms_created();
+
+        Fixture { api, observations, tx_hashes }
+    }
+
+    fn block_start_value() -> U256 {
+        U256::from(BLOCK_START_VALUE)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_trace_transaction_in_block_sees_block_start_context() {
+        let f = fixture(3);
+
+        f.api
+            .eth_api()
+            .spawn_trace_transaction_in_block(
+                f.tx_hashes[2],
+                TracingInspectorConfig::default_parity(),
+                |_, _, _, _| Ok(()),
+            )
+            .await
+            .unwrap()
+            .expect("transaction should be found");
+
+        assert_eq!(f.observations.take_values(), vec![block_start_value(); 3]);
+        assert_eq!(f.observations.take_evms_created(), 2);
     }
 }
