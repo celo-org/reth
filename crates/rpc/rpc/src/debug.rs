@@ -1,6 +1,10 @@
 use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader};
 use alloy_eips::{eip2718::Encodable2718, BlockId, BlockNumberOrTag};
-use alloy_evm::{env::BlockEnvironment, Evm};
+use alloy_evm::{
+    env::BlockEnvironment,
+    overrides::{apply_block_overrides, apply_state_overrides},
+    Evm,
+};
 use alloy_genesis::ChainConfig;
 use alloy_primitives::{hex::decode, uint, Address, Bytes, B256, U64};
 use alloy_rlp::{Decodable, Encodable};
@@ -449,7 +453,14 @@ where
             self.eth_api().evm_env_for_header(block.sealed_block().sealed_header())?;
 
         let opts = opts.unwrap_or_default();
-        let GethDebugTracingCallOptions { tracing_options, mut state_overrides, .. } = opts;
+        let GethDebugTracingCallOptions { tracing_options, state_overrides, .. } = opts;
+        // An empty map has no semantic effect and should not opt out of canonical context pinning.
+        let state_overrides = state_overrides.filter(|overrides| !overrides.is_empty());
+        let has_state_overrides = state_overrides.is_some();
+        let first_bundle_has_transactions =
+            bundles.first().is_some_and(|bundle| !bundle.transactions.is_empty());
+        let first_block_override = bundles.first().and_then(|bundle| bundle.block_override.clone());
+        let first_bundle_has_block_override = first_block_override.is_some();
 
         // we're essentially replaying the transactions in the block here, hence we need the state
         // that points to the beginning of the block, which is the state at the parent block
@@ -467,24 +478,51 @@ where
             replay_block_txs = false;
         }
 
+        // `TransactionIndex::All` simulates on top of the target block's final state, but the
+        // first simulated bundle still needs block-scoped context from the target block's start.
+        // A detached parent-state read preserves the final-state optimization. A first-bundle
+        // block override also needs detached capture so canonical prefix replay remains untouched.
+        let initial_replay_ctx = if !has_state_overrides &&
+            first_bundle_has_transactions &&
+            (!replay_block_txs || first_bundle_has_block_override)
+        {
+            let capture_block = block.clone();
+            let mut capture_env = evm_env.clone();
+            self.eth_api()
+                .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
+                    eth_api.apply_pre_execution_changes(&capture_block, &mut db)?;
+                    if let Some(block_override) = first_block_override {
+                        apply_block_overrides(
+                            block_override,
+                            &mut db,
+                            capture_env.block_env.inner_mut(),
+                        );
+                    }
+                    Ok(eth_api.evm_config().capture_block_replay_ctx(&mut db, &capture_env))
+                })
+                .await?
+        } else {
+            None
+        };
+
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
                 // the outer vec for the bundles
                 let mut all_bundles = Vec::with_capacity(bundles.len());
 
-                let mut replay_ctx = None;
+                let mut initial_replay_ctx = initial_replay_ctx;
                 if replay_block_txs {
                     // only need to replay the transactions in the block if not all transactions are
                     // to be replayed
                     eth_api.apply_pre_execution_changes(&block, &mut db)?;
 
-                    // capture block-scoped EVM context from block-start state, so bundle calls
-                    // simulated at a mid-block position see the same context a transaction
-                    // included in this block would. Explicit state overrides opt out: the
-                    // caller diverged from canonical state, so the context is loaded from the
-                    // overridden state instead.
-                    if state_overrides.is_none() {
-                        replay_ctx =
+                    // Without a first-bundle block override, capture inline from canonical
+                    // block-start state before replaying the prefix.
+                    if !has_state_overrides &&
+                        first_bundle_has_transactions &&
+                        !first_bundle_has_block_override
+                    {
+                        initial_replay_ctx =
                             eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
                     }
 
@@ -497,46 +535,57 @@ where
                         let tx_env = eth_api.evm_config().tx_env(tx);
                         evm.transact_commit(tx_env).map_err(Eth::Error::from_evm_err)?;
                     }
-                } else if state_overrides.is_none() {
-                    // No prefix replay: the first bundle simulates on top of the block's final
-                    // state, so its block-scoped context is captured from that state. The
-                    // state-override opt-out applies as above.
-                    replay_ctx = eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
+                }
+
+                // State overrides define the starting state of the simulated bundles. Apply them
+                // exactly once, even if the first bundle is empty, before capturing any context
+                // that is derived from overridden state.
+                if let Some(state_overrides) = state_overrides {
+                    apply_state_overrides(state_overrides, &mut db)
+                        .map_err(EthApiError::from_state_overrides_err)
+                        .map_err(Eth::Error::from_eth_err)?;
                 }
 
                 // Trace all bundles
-                let mut bundles = bundles.into_iter().peekable();
-                let mut first_bundle = true;
+                let mut bundles = bundles.into_iter().enumerate().peekable();
                 let mut inspector = DebugInspector::new(tracing_options.clone())
                     .map_err(Eth::Error::from_eth_err)?;
-                while let Some(bundle) = bundles.next() {
-                    // Every bundle simulates a block of its own, and each transaction of a
-                    // bundle must see the context from that simulated block's start: re-capture
-                    // for follow-up bundles from the state the previous bundle committed (any
-                    // state overrides are already part of that state).
-                    if !first_bundle {
-                        replay_ctx =
-                            eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
-                    }
-                    first_bundle = false;
-
+                while let Some((bundle_index, bundle)) = bundles.next() {
                     let mut results = Vec::with_capacity(bundle.transactions.len());
                     let Bundle { transactions, block_override } = bundle;
 
-                    let block_overrides = block_override.map(Box::new);
+                    let mut bundle_env = evm_env.clone();
+                    if let Some(block_override) = block_override {
+                        apply_block_overrides(
+                            block_override,
+                            &mut db,
+                            bundle_env.block_env.inner_mut(),
+                        );
+                    }
+
+                    // Each non-empty bundle runs as its own simulated block. Reuse the canonical
+                    // first-bundle context when available; otherwise capture after state and block
+                    // overrides from the state committed by previous bundles.
+                    let replay_ctx = if transactions.is_empty() {
+                        None
+                    } else if bundle_index == 0 && !has_state_overrides {
+                        initial_replay_ctx.take()
+                    } else {
+                        eth_api.evm_config().capture_block_replay_ctx(&mut db, &bundle_env)
+                    };
 
                     let mut transactions = transactions.into_iter().peekable();
                     while let Some(tx) = transactions.next() {
-                        // apply state overrides only once, before the first transaction
-                        let state_overrides = state_overrides.take();
-                        let overrides = EvmOverrides::new(state_overrides, block_overrides.clone());
-
-                        let (evm_env, tx_env) =
-                            eth_api.prepare_call_env(evm_env.clone(), tx, &mut db, overrides)?;
+                        let (call_env, tx_env) = eth_api.prepare_call_env(
+                            bundle_env.clone(),
+                            tx,
+                            &mut db,
+                            EvmOverrides::default(),
+                        )?;
 
                         let mut evm = eth_api.evm_config().evm_with_env_and_inspector(
                             &mut db,
-                            evm_env.clone(),
+                            call_env.clone(),
                             &mut inspector,
                         );
                         if let Some(ctx) = &replay_ctx {
@@ -545,7 +594,7 @@ where
                         let res = evm.transact(tx_env.clone()).map_err(Eth::Error::from_evm_err)?;
                         drop(evm);
                         let trace = inspector
-                            .get_result(None, &tx_env, &evm_env.block_env, &res, &mut db)
+                            .get_result(None, &tx_env, &call_env.block_env, &res, &mut db)
                             .map_err(Eth::Error::from_eth_err)?;
 
                         // If there is more transactions, commit the database
@@ -1332,26 +1381,41 @@ mod tests {
     use crate::{EthApi, EthApiBuilder};
     use alloy_consensus::{Header, TxLegacy};
     use alloy_network::Ethereum;
-    use alloy_primitives::{Signature, TxKind};
-    use alloy_rpc_types_eth::{state::StateOverride, TransactionIndex, TransactionRequest};
+    use alloy_primitives::{address, Signature, TxKind, U256};
+    use alloy_rpc_types_eth::{
+        state::{StateOverride, StateOverridesBuilder},
+        BlockOverrides, TransactionIndex, TransactionRequest,
+    };
     use reth_chainspec::ChainSpec;
     use reth_ethereum_primitives::{EthPrimitives, Transaction, TransactionSigned};
     use reth_evm::{ConfigureEvm, EvmEnvFor, EvmFor, ExecutionCtxFor, InspectorFor};
     use reth_evm_ethereum::EthEvmConfig;
     use reth_network_api::noop::NoopNetwork;
     use reth_primitives_traits::SealedBlock;
-    use reth_provider::test_utils::MockEthProvider;
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_rpc_convert::RpcConverter;
     use reth_rpc_eth_api::node::RpcNodeCoreAdapter;
     use reth_rpc_eth_types::receipt::EthReceiptConverter;
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
     use std::{
         any::Any,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
     };
 
-    /// Marker context returned by [`CountingEvmConfig::capture_block_replay_ctx`].
-    struct CapturedCtx;
+    const MARKER: Address = address!("00000000000000000000000000000000000000bb");
+
+    /// Context recorded by [`CountingEvmConfig`] when call simulation crosses EVM boundaries.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CapturedCtx {
+        id: usize,
+        lookup_hash: Option<B256>,
+        marker_balance: Option<U256>,
+        block_number: U256,
+        timestamp: U256,
+    }
 
     /// An [`EthEvmConfig`] wrapper counting block replay context captures and seeds.
     #[derive(Debug, Clone)]
@@ -1359,6 +1423,10 @@ mod tests {
         inner: EthEvmConfig,
         captures: Arc<AtomicUsize>,
         seeds: Arc<AtomicUsize>,
+        next_id: Arc<AtomicUsize>,
+        captured_ctxs: Arc<Mutex<Vec<CapturedCtx>>>,
+        seeded_ctxs: Arc<Mutex<Vec<CapturedCtx>>>,
+        history_state_lookups: Arc<parking_lot::Mutex<Vec<B256>>>,
     }
 
     impl ConfigureEvm for CountingEvmConfig {
@@ -1405,11 +1473,19 @@ mod tests {
 
         fn capture_block_replay_ctx<DB: reth_evm::Database>(
             &self,
-            _db: &mut DB,
-            _evm_env: &EvmEnvFor<Self>,
+            db: &mut DB,
+            evm_env: &EvmEnvFor<Self>,
         ) -> Option<Box<dyn Any + Send>> {
             self.captures.fetch_add(1, Ordering::SeqCst);
-            Some(Box::new(CapturedCtx))
+            let ctx = CapturedCtx {
+                id: self.next_id.fetch_add(1, Ordering::SeqCst),
+                lookup_hash: self.history_state_lookups.lock().last().copied(),
+                marker_balance: db.basic(MARKER).ok().flatten().map(|account| account.balance),
+                block_number: evm_env.block_env.number,
+                timestamp: evm_env.block_env.timestamp,
+            };
+            self.captured_ctxs.lock().unwrap().push(ctx.clone());
+            Some(Box::new(ctx))
         }
 
         fn seed_block_replay_ctx<DB, I>(
@@ -1420,7 +1496,8 @@ mod tests {
             DB: reth_evm::Database,
             I: InspectorFor<Self, DB>,
         {
-            assert!(ctx.downcast_ref::<CapturedCtx>().is_some());
+            let ctx = ctx.downcast_ref::<CapturedCtx>().expect("captured context type");
+            self.seeded_ctxs.lock().unwrap().push(ctx.clone());
             self.seeds.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -1430,11 +1507,21 @@ mod tests {
         RpcConverter<Ethereum, CountingEvmConfig, EthReceiptConverter<ChainSpec>>,
     >;
 
-    /// Builds a [`DebugApi`] over a mock one-transaction block at height 1, returning the
-    /// capture and seed counters and the block hash.
-    fn counting_debug_api() -> (DebugApi<CountingEthApi>, Arc<AtomicUsize>, Arc<AtomicUsize>, B256)
-    {
+    struct CountingFixture {
+        api: DebugApi<CountingEthApi>,
+        captures: Arc<AtomicUsize>,
+        seeds: Arc<AtomicUsize>,
+        captured_ctxs: Arc<Mutex<Vec<CapturedCtx>>>,
+        seeded_ctxs: Arc<Mutex<Vec<CapturedCtx>>>,
+        history_state_lookups: Arc<parking_lot::Mutex<Vec<B256>>>,
+        parent_hash: B256,
+        block_hash: B256,
+    }
+
+    /// Builds a [`DebugApi`] over a mock one-transaction block at height 1.
+    fn counting_debug_api() -> CountingFixture {
         let provider = MockEthProvider::default().with_recovered_blocks();
+        provider.add_account(MARKER, ExtendedAccount::new(0, U256::from(1)));
 
         let parent = Header { number: 0, gas_limit: 30_000_000, ..Default::default() };
         let parent_hash = parent.hash_slow();
@@ -1456,10 +1543,17 @@ mod tests {
 
         let captures = Arc::new(AtomicUsize::new(0));
         let seeds = Arc::new(AtomicUsize::new(0));
+        let captured_ctxs = Arc::new(Mutex::new(Vec::new()));
+        let seeded_ctxs = Arc::new(Mutex::new(Vec::new()));
+        let history_state_lookups = provider.history_state_lookups.clone();
         let evm_config = CountingEvmConfig {
             inner: EthEvmConfig::new(provider.chain_spec()),
             captures: captures.clone(),
             seeds: seeds.clone(),
+            next_id: Arc::new(AtomicUsize::new(0)),
+            captured_ctxs: captured_ctxs.clone(),
+            seeded_ctxs: seeded_ctxs.clone(),
+            history_state_lookups: history_state_lookups.clone(),
         };
         let eth_api =
             EthApiBuilder::new(provider, testing_pool(), NoopNetwork::default(), evm_config)
@@ -1470,81 +1564,181 @@ mod tests {
             &Runtime::test(),
             futures::stream::empty::<ConsensusEngineEvent<EthPrimitives>>(),
         );
-        (debug_api, captures, seeds, block_hash)
+        CountingFixture {
+            api: debug_api,
+            captures,
+            seeds,
+            captured_ctxs,
+            seeded_ctxs,
+            history_state_lookups,
+            parent_hash,
+            block_hash,
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn trace_call_at_tx_index_seeds_block_start_context() {
-        let (api, captures, seeds, block_hash) = counting_debug_api();
+        let f = counting_debug_api();
 
         let opts = GethDebugTracingCallOptions { tx_index: Some(0), ..Default::default() };
-        api.debug_trace_call(TransactionRequest::default(), Some(block_hash.into()), opts)
+        f.api
+            .debug_trace_call(TransactionRequest::default(), Some(f.block_hash.into()), opts)
             .await
             .unwrap();
 
-        assert_eq!(captures.load(Ordering::SeqCst), 1);
-        assert_eq!(seeds.load(Ordering::SeqCst), 1);
+        assert_eq!(f.captures.load(Ordering::SeqCst), 1);
+        assert_eq!(f.seeds.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn trace_call_at_tx_index_skips_capture_with_state_overrides() {
-        let (api, captures, seeds, block_hash) = counting_debug_api();
+        let f = counting_debug_api();
 
         let opts = GethDebugTracingCallOptions {
             tx_index: Some(0),
             state_overrides: Some(StateOverride::default()),
             ..Default::default()
         };
-        api.debug_trace_call(TransactionRequest::default(), Some(block_hash.into()), opts)
+        f.api
+            .debug_trace_call(TransactionRequest::default(), Some(f.block_hash.into()), opts)
             .await
             .unwrap();
 
-        assert_eq!(captures.load(Ordering::SeqCst), 0);
-        assert_eq!(seeds.load(Ordering::SeqCst), 0);
+        assert_eq!(f.captures.load(Ordering::SeqCst), 0);
+        assert_eq!(f.seeds.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn trace_call_many_captures_context_per_bundle() {
-        let (api, captures, seeds, block_hash) = counting_debug_api();
+        let f = counting_debug_api();
 
         let bundles = vec![
             Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
             Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
         ];
         let context = StateContext {
-            block_number: Some(block_hash.into()),
+            block_number: Some(f.block_hash.into()),
             transaction_index: Some(TransactionIndex::Index(0)),
         };
-        api.debug_trace_call_many(bundles, Some(context), None).await.unwrap();
+        f.api.debug_trace_call_many(bundles, Some(context), None).await.unwrap();
 
-        // one capture at block start plus one re-capture for the second bundle, each
-        // seeding its bundle's transaction
-        assert_eq!(captures.load(Ordering::SeqCst), 2);
-        assert_eq!(seeds.load(Ordering::SeqCst), 2);
+        assert_eq!(f.captures.load(Ordering::SeqCst), 2);
+        assert_eq!(f.seeds.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn trace_call_many_skips_first_capture_with_state_overrides() {
-        let (api, captures, seeds, block_hash) = counting_debug_api();
+    async fn trace_call_many_all_captures_parent_context() {
+        let f = counting_debug_api();
 
-        let bundles = vec![
-            Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
-            Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
-        ];
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+        let context =
+            StateContext { block_number: Some(f.block_hash.into()), transaction_index: None };
+        f.api.debug_trace_call_many(bundles, Some(context), None).await.unwrap();
+
+        let captured = f.captured_ctxs.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].lookup_hash, Some(f.parent_hash));
+        drop(captured);
+
+        let lookups = f.history_state_lookups.lock();
+        assert_eq!(lookups.as_slice(), &[f.parent_hash, f.block_hash]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_empty_state_overrides_keep_bundle_context_pinned() {
+        let f = counting_debug_api();
+
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default(), TransactionRequest::default()],
+            block_override: None,
+        }];
         let context = StateContext {
-            block_number: Some(block_hash.into()),
+            block_number: Some(f.block_hash.into()),
             transaction_index: Some(TransactionIndex::Index(0)),
         };
         let opts = GethDebugTracingCallOptions {
             state_overrides: Some(StateOverride::default()),
             ..Default::default()
         };
-        api.debug_trace_call_many(bundles, Some(context), Some(opts)).await.unwrap();
+        f.api.debug_trace_call_many(bundles, Some(context), Some(opts)).await.unwrap();
 
-        // the overridden first bundle loads context from its state; only the second
-        // bundle re-captures (from state that already includes the overrides)
-        assert_eq!(captures.load(Ordering::SeqCst), 1);
-        assert_eq!(seeds.load(Ordering::SeqCst), 1);
+        assert_eq!(f.captures.load(Ordering::SeqCst), 1);
+        assert_eq!(f.seeds.load(Ordering::SeqCst), 2);
+        let seeded = f.seeded_ctxs.lock().unwrap();
+        assert_eq!(seeded[0].id, seeded[1].id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_applies_state_override_before_capture_after_empty_bundle() {
+        let f = counting_debug_api();
+
+        let bundles = vec![
+            Bundle { transactions: Vec::new(), block_override: None },
+            Bundle {
+                transactions: vec![TransactionRequest::default(), TransactionRequest::default()],
+                block_override: None,
+            },
+        ];
+        let context = StateContext {
+            block_number: Some(f.block_hash.into()),
+            transaction_index: Some(TransactionIndex::Index(0)),
+        };
+        let opts = GethDebugTracingCallOptions {
+            state_overrides: Some(
+                StateOverridesBuilder::default().with_balance(MARKER, U256::from(7)).build(),
+            ),
+            ..Default::default()
+        };
+        f.api.debug_trace_call_many(bundles, Some(context), Some(opts)).await.unwrap();
+
+        let seeded = f.seeded_ctxs.lock().unwrap();
+        assert_eq!(seeded.len(), 2);
+        assert!(seeded.iter().all(|ctx| ctx.marker_balance == Some(U256::from(7))));
+        assert!(seeded.iter().all(|ctx| ctx.block_number == U256::from(2)));
+        assert_eq!(seeded[0].id, seeded[1].id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_capture_uses_each_bundle_block_override() {
+        let f = counting_debug_api();
+
+        let bundles = vec![
+            Bundle {
+                transactions: vec![TransactionRequest::default()],
+                block_override: Some(BlockOverrides {
+                    number: Some(U256::from(10)),
+                    time: Some(100),
+                    ..Default::default()
+                }),
+            },
+            Bundle {
+                transactions: vec![TransactionRequest::default()],
+                block_override: Some(BlockOverrides {
+                    number: Some(U256::from(20)),
+                    time: Some(200),
+                    ..Default::default()
+                }),
+            },
+        ];
+        let context = StateContext {
+            block_number: Some(f.block_hash.into()),
+            transaction_index: Some(TransactionIndex::Index(0)),
+        };
+        f.api.debug_trace_call_many(bundles, Some(context), None).await.unwrap();
+
+        let seeded = f.seeded_ctxs.lock().unwrap();
+        assert_eq!(seeded.len(), 2);
+        assert_eq!(
+            (seeded[0].block_number, seeded[0].timestamp),
+            (U256::from(10), U256::from(100))
+        );
+        assert_eq!(
+            (seeded[1].block_number, seeded[1].timestamp),
+            (U256::from(20), U256::from(200))
+        );
     }
 }
 

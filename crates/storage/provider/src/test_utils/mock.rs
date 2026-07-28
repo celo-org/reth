@@ -71,6 +71,8 @@ pub struct MockEthProvider<T: NodePrimitives = EthPrimitives, ChainSpec = reth_c
     pub state_roots: Arc<Mutex<Vec<B256>>>,
     /// Local block body indices store
     pub block_body_indices: Arc<Mutex<HashMap<BlockNumber, StoredBlockBodyIndices>>>,
+    /// Historical state hashes requested through [`StateProviderFactory`].
+    pub history_state_lookups: Arc<Mutex<Vec<BlockHash>>>,
     /// Local BAL store handle
     pub bal_store: BalStoreHandle,
     tx: TxMock,
@@ -91,6 +93,7 @@ where
             chain_spec: self.chain_spec.clone(),
             state_roots: self.state_roots.clone(),
             block_body_indices: self.block_body_indices.clone(),
+            history_state_lookups: self.history_state_lookups.clone(),
             bal_store: self.bal_store.clone(),
             tx: self.tx.clone(),
             prune_modes: self.prune_modes.clone(),
@@ -110,6 +113,7 @@ impl<T: NodePrimitives> MockEthProvider<T, reth_chainspec::ChainSpec> {
             chain_spec: Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().build()),
             state_roots: Default::default(),
             block_body_indices: Default::default(),
+            history_state_lookups: Default::default(),
             bal_store: Default::default(),
             tx: Default::default(),
             prune_modes: Default::default(),
@@ -195,6 +199,7 @@ impl<T: NodePrimitives, ChainSpec> MockEthProvider<T, ChainSpec> {
             chain_spec: Arc::new(chain_spec),
             state_roots: self.state_roots,
             block_body_indices: self.block_body_indices,
+            history_state_lookups: self.history_state_lookups,
             bal_store: self.bal_store,
             tx: self.tx,
             prune_modes: self.prune_modes,
@@ -995,7 +1000,8 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + Send + Sync + 'static> StatePr
         Ok(Box::new(self.clone()))
     }
 
-    fn history_by_block_hash(&self, _block: BlockHash) -> ProviderResult<StateProviderBox> {
+    fn history_by_block_hash(&self, block: BlockHash) -> ProviderResult<StateProviderBox> {
+        self.history_state_lookups.lock().push(block);
         Ok(Box::new(self.clone()))
     }
 
