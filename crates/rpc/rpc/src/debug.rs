@@ -311,6 +311,7 @@ where
             block_overrides,
             tx_index,
         } = opts;
+        let state_overrides = state_overrides.filter(|overrides| !overrides.is_empty());
         let overrides = EvmOverrides::new(state_overrides, block_overrides.map(Box::new));
 
         // Check if we need to replay transactions for a specific tx_index
@@ -372,28 +373,43 @@ where
         // execute after the parent block, replaying `tx_index` transactions
         let state_at = block.parent_hash();
 
+        // The call executes over state after the replayed prefix, but block-scoped context still
+        // comes from block-start state. Apply the same caller overrides to a detached block-start
+        // overlay so unrelated overrides do not switch context to mid-block state, while
+        // context-relevant overrides are respected.
+        let capture_block = block.clone();
+        let mut capture_env = evm_env.clone();
+        let capture_overrides = overrides.clone();
+        let replay_ctx = self
+            .eth_api()
+            .spawn_with_state_at_block(state_at, move |eth_api, mut db| {
+                eth_api.apply_pre_execution_changes(&capture_block, &mut db)?;
+                if let Some(block_overrides) = capture_overrides.block {
+                    apply_block_overrides(
+                        *block_overrides,
+                        &mut db,
+                        capture_env.block_env.inner_mut(),
+                    );
+                }
+                if let Some(state_overrides) = capture_overrides.state {
+                    apply_state_overrides(state_overrides, &mut db)
+                        .map_err(EthApiError::from_state_overrides_err)
+                        .map_err(Eth::Error::from_eth_err)?;
+                }
+                Ok(eth_api.evm_config().capture_block_replay_ctx(&mut db, &capture_env))
+            })
+            .await?;
+
         self.eth_api()
             .spawn_with_state_at_block(state_at, move |eth_api, mut db| {
                 // 1. apply pre-execution changes
                 eth_api.apply_pre_execution_changes(&block, &mut db)?;
 
-                // capture block-scoped EVM context from block-start state, so the traced call
-                // sees the same context a transaction included in this block would. Explicit
-                // state overrides opt out: the caller diverged from canonical state, so the
-                // context is loaded from the overridden state instead, matching the
-                // non-tx-index path.
-                //
                 // Unlike debug_trace_transaction, the traced call cannot share the replay EVM:
                 // the call runs under a caller-modified env (prepare_call_env applies the
                 // request and overrides) and an EVM's env cannot be swapped after
                 // construction, so the call gets a fresh EVM and the block-start context is
                 // transplanted via capture/seed.
-                let replay_ctx = if overrides.has_state() {
-                    None
-                } else {
-                    eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env)
-                };
-
                 // 2. replay the required number of transactions
                 eth_api.replay_transactions_until(
                     &mut db,
@@ -456,11 +472,11 @@ where
         let GethDebugTracingCallOptions { tracing_options, state_overrides, .. } = opts;
         // An empty map has no semantic effect and should not opt out of canonical context pinning.
         let state_overrides = state_overrides.filter(|overrides| !overrides.is_empty());
-        let has_state_overrides = state_overrides.is_some();
         let first_bundle_has_transactions =
             bundles.first().is_some_and(|bundle| !bundle.transactions.is_empty());
         let first_block_override = bundles.first().and_then(|bundle| bundle.block_override.clone());
-        let first_bundle_has_block_override = first_block_override.is_some();
+        let first_bundle_has_overrides =
+            state_overrides.is_some() || first_block_override.is_some();
 
         // we're essentially replaying the transactions in the block here, hence we need the state
         // that points to the beginning of the block, which is the state at the parent block
@@ -480,30 +496,34 @@ where
 
         // `TransactionIndex::All` simulates on top of the target block's final state, but the
         // first simulated bundle still needs block-scoped context from the target block's start.
-        // A detached parent-state read preserves the final-state optimization. A first-bundle
-        // block override also needs detached capture so canonical prefix replay remains untouched.
-        let initial_replay_ctx = if !has_state_overrides &&
-            first_bundle_has_transactions &&
-            (!replay_block_txs || first_bundle_has_block_override)
-        {
-            let capture_block = block.clone();
-            let mut capture_env = evm_env.clone();
-            self.eth_api()
-                .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
-                    eth_api.apply_pre_execution_changes(&capture_block, &mut db)?;
-                    if let Some(block_override) = first_block_override {
-                        apply_block_overrides(
-                            block_override,
-                            &mut db,
-                            capture_env.block_env.inner_mut(),
-                        );
-                    }
-                    Ok(eth_api.evm_config().capture_block_replay_ctx(&mut db, &capture_env))
-                })
-                .await?
-        } else {
-            None
-        };
+        // A detached parent-state read preserves the final-state optimization. Caller overrides
+        // also need detached capture so canonical prefix replay remains untouched.
+        let initial_replay_ctx =
+            if first_bundle_has_transactions && (!replay_block_txs || first_bundle_has_overrides) {
+                let capture_block = block.clone();
+                let mut capture_env = evm_env.clone();
+                let capture_state_overrides = state_overrides.clone();
+                self.eth_api()
+                    .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
+                        eth_api.apply_pre_execution_changes(&capture_block, &mut db)?;
+                        if let Some(block_override) = first_block_override {
+                            apply_block_overrides(
+                                block_override,
+                                &mut db,
+                                capture_env.block_env.inner_mut(),
+                            );
+                        }
+                        if let Some(state_overrides) = capture_state_overrides {
+                            apply_state_overrides(state_overrides, &mut db)
+                                .map_err(EthApiError::from_state_overrides_err)
+                                .map_err(Eth::Error::from_eth_err)?;
+                        }
+                        Ok(eth_api.evm_config().capture_block_replay_ctx(&mut db, &capture_env))
+                    })
+                    .await?
+            } else {
+                None
+            };
 
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
@@ -518,10 +538,7 @@ where
 
                     // Without a first-bundle block override, capture inline from canonical
                     // block-start state before replaying the prefix.
-                    if !has_state_overrides &&
-                        first_bundle_has_transactions &&
-                        !first_bundle_has_block_override
-                    {
+                    if first_bundle_has_transactions && !first_bundle_has_overrides {
                         initial_replay_ctx =
                             eth_api.evm_config().capture_block_replay_ctx(&mut db, &evm_env);
                     }
@@ -568,7 +585,7 @@ where
                     // overrides from the state committed by previous bundles.
                     let replay_ctx = if transactions.is_empty() {
                         None
-                    } else if bundle_index == 0 && !has_state_overrides {
+                    } else if bundle_index == 0 {
                         initial_replay_ctx.take()
                     } else {
                         eth_api.evm_config().capture_block_replay_ctx(&mut db, &bundle_env)
@@ -1406,6 +1423,7 @@ mod tests {
     };
 
     const MARKER: Address = address!("00000000000000000000000000000000000000bb");
+    const UNRELATED: Address = address!("00000000000000000000000000000000000000cc");
 
     /// Context recorded by [`CountingEvmConfig`] when call simulation crosses EVM boundaries.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1591,12 +1609,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn trace_call_at_tx_index_skips_capture_with_state_overrides() {
+    async fn trace_call_at_tx_index_applies_overrides_before_capture() {
         let f = counting_debug_api();
 
         let opts = GethDebugTracingCallOptions {
             tx_index: Some(0),
-            state_overrides: Some(StateOverride::default()),
+            state_overrides: Some(
+                StateOverridesBuilder::default().with_balance(MARKER, U256::from(7)).build(),
+            ),
+            block_overrides: Some(BlockOverrides {
+                number: Some(U256::from(10)),
+                time: Some(100),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         f.api
@@ -1604,8 +1629,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(f.captures.load(Ordering::SeqCst), 0);
-        assert_eq!(f.seeds.load(Ordering::SeqCst), 0);
+        assert_eq!(f.captures.load(Ordering::SeqCst), 1);
+        assert_eq!(f.seeds.load(Ordering::SeqCst), 1);
+        let seeded = f.seeded_ctxs.lock().unwrap();
+        assert_eq!(seeded[0].lookup_hash, Some(f.parent_hash));
+        assert_eq!(seeded[0].marker_balance, Some(U256::from(7)));
+        assert_eq!(seeded[0].block_number, U256::from(10));
+        assert_eq!(seeded[0].timestamp, U256::from(100));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1669,6 +1699,54 @@ mod tests {
         assert_eq!(f.seeds.load(Ordering::SeqCst), 2);
         let seeded = f.seeded_ctxs.lock().unwrap();
         assert_eq!(seeded[0].id, seeded[1].id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_all_with_unrelated_override_captures_parent_context() {
+        let f = counting_debug_api();
+
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+        let context =
+            StateContext { block_number: Some(f.block_hash.into()), transaction_index: None };
+        let opts = GethDebugTracingCallOptions {
+            state_overrides: Some(
+                StateOverridesBuilder::default().with_balance(UNRELATED, U256::from(7)).build(),
+            ),
+            ..Default::default()
+        };
+        f.api.debug_trace_call_many(bundles, Some(context), Some(opts)).await.unwrap();
+
+        let seeded = f.seeded_ctxs.lock().unwrap();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].lookup_hash, Some(f.parent_hash));
+        assert_eq!(seeded[0].marker_balance, Some(U256::from(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_all_applies_relevant_override_to_parent_context() {
+        let f = counting_debug_api();
+
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+        let context =
+            StateContext { block_number: Some(f.block_hash.into()), transaction_index: None };
+        let opts = GethDebugTracingCallOptions {
+            state_overrides: Some(
+                StateOverridesBuilder::default().with_balance(MARKER, U256::from(7)).build(),
+            ),
+            ..Default::default()
+        };
+        f.api.debug_trace_call_many(bundles, Some(context), Some(opts)).await.unwrap();
+
+        let seeded = f.seeded_ctxs.lock().unwrap();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].lookup_hash, Some(f.parent_hash));
+        assert_eq!(seeded[0].marker_balance, Some(U256::from(7)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
