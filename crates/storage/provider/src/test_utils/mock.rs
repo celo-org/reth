@@ -76,6 +76,8 @@ pub struct MockEthProvider<T: NodePrimitives = EthPrimitives, ChainSpec = reth_c
     pub block_body_indices: Arc<Mutex<HashMap<BlockNumber, StoredBlockBodyIndices>>>,
     /// Local stage checkpoints
     stage_checkpoints: Arc<Mutex<HashMap<StageId, StageCheckpoint>>>,
+    /// Historical state hashes requested through [`StateProviderFactory`].
+    pub history_state_lookups: Arc<Mutex<Vec<BlockHash>>>,
     /// Local BAL store handle
     pub bal_store: BalStoreHandle,
     /// Whether database provider creation succeeds.
@@ -131,6 +133,7 @@ where
             state_roots: self.state_roots.clone(),
             block_body_indices: self.block_body_indices.clone(),
             stage_checkpoints: self.stage_checkpoints.clone(),
+            history_state_lookups: self.history_state_lookups.clone(),
             bal_store: self.bal_store.clone(),
             database_provider_available: self.database_provider_available.clone(),
             snap_state_reads_fail: self.snap_state_reads_fail.clone(),
@@ -160,6 +163,7 @@ impl<T: NodePrimitives> MockEthProvider<T, reth_chainspec::ChainSpec> {
             state_roots: Default::default(),
             block_body_indices: Default::default(),
             stage_checkpoints: Default::default(),
+            history_state_lookups: Default::default(),
             bal_store: Default::default(),
             database_provider_available: Default::default(),
             snap_state_reads_fail: Default::default(),
@@ -331,6 +335,7 @@ impl<T: NodePrimitives, ChainSpec> MockEthProvider<T, ChainSpec> {
             state_roots: self.state_roots,
             block_body_indices: self.block_body_indices,
             stage_checkpoints: self.stage_checkpoints,
+            history_state_lookups: self.history_state_lookups,
             bal_store: self.bal_store,
             database_provider_available: self.database_provider_available,
             snap_state_reads_fail: self.snap_state_reads_fail,
@@ -1222,7 +1227,8 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + Send + Sync + 'static> StatePr
         Ok(Box::new(self.clone()))
     }
 
-    fn history_by_block_hash(&self, _block: BlockHash) -> ProviderResult<StateProviderBox> {
+    fn history_by_block_hash(&self, block: BlockHash) -> ProviderResult<StateProviderBox> {
+        self.history_state_lookups.lock().push(block);
         Ok(Box::new(self.clone()))
     }
 
