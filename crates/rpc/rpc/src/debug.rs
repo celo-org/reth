@@ -536,7 +536,9 @@ where
                     let Bundle { transactions, block_override } = bundle;
 
                     let mut bundle_env = evm_env.clone();
-                    if let Some(block_override) = block_override {
+                    if !transactions.is_empty() &&
+                        let Some(block_override) = block_override
+                    {
                         apply_block_overrides(
                             block_override,
                             &mut db,
@@ -1397,6 +1399,7 @@ mod tests {
 
     const MARKER: Address = address!("00000000000000000000000000000000000000bb");
     const UNRELATED: Address = address!("00000000000000000000000000000000000000cc");
+    const BLOCKHASH_READER: Address = address!("00000000000000000000000000000000000000dd");
 
     /// Context recorded by [`CountingEvmConfig`] when call simulation crosses EVM boundaries.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1502,6 +1505,12 @@ mod tests {
     fn counting_debug_api() -> CountingFixture {
         let provider = MockEthProvider::default();
         provider.add_account(MARKER, ExtendedAccount::new(0, U256::from(1)));
+        provider.add_account(
+            BLOCKHASH_READER,
+            ExtendedAccount::new(0, U256::ZERO).with_bytecode(Bytes::from_static(&[
+                0x60, 0x00, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+            ])),
+        );
 
         let parent = Header { number: 0, gas_limit: 30_000_000, ..Default::default() };
         let parent_hash = parent.hash_slow();
@@ -1790,5 +1799,37 @@ mod tests {
             (seeded[1].block_number, seeded[1].timestamp),
             (U256::from(20), U256::from(200))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_empty_bundle_does_not_leak_block_hash_override() {
+        let f = counting_debug_api();
+        let overridden_hash = B256::repeat_byte(0x42);
+
+        let bundles = vec![
+            Bundle {
+                transactions: Vec::new(),
+                block_override: Some(BlockOverrides {
+                    block_hash: Some([(0, overridden_hash)].into()),
+                    ..Default::default()
+                }),
+            },
+            Bundle {
+                transactions: vec![TransactionRequest {
+                    to: Some(TxKind::Call(BLOCKHASH_READER)),
+                    gas: Some(100_000),
+                    ..Default::default()
+                }],
+                block_override: None,
+            },
+        ];
+        let context = StateContext {
+            block_number: Some(f.block_hash.into()),
+            transaction_index: Some(TransactionIndex::Index(0)),
+        };
+        let traces = f.api.debug_trace_call_many(bundles, Some(context), None).await.unwrap();
+
+        let GethTrace::Default(frame) = &traces[1][0] else { panic!("expected default trace") };
+        assert_eq!(frame.return_value.as_ref(), f.parent_hash.as_slice());
     }
 }
