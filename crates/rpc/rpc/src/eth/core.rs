@@ -941,6 +941,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_call_many_leading_empty_bundle_keeps_initial_context() {
+        let provider = MockEthProvider::default().with_recovered_blocks();
+        provider.add_account(CONTEXT_MARKER, ExtendedAccount::new(0, U256::from(1)));
+
+        let prefix_tx = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy {
+                gas_limit: 21_000,
+                to: TxKind::Call(CONTEXT_MARKER),
+                value: U256::from(6),
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        let sender = prefix_tx.recover_signer().unwrap();
+        provider.add_account(sender, ExtendedAccount::new(0, U256::from(1_000_000)));
+
+        let parent = Header { number: 0, gas_limit: 30_000_000, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+        let trailing_tx = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy {
+                nonce: 1,
+                gas_limit: 21_000,
+                to: TxKind::Call(CONTEXT_MARKER),
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        let block = Block {
+            header: Header { number: 1, parent_hash, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody { transactions: vec![prefix_tx, trailing_tx], ..Default::default() },
+        };
+        let block_hash = block.header.hash_slow();
+        provider.add_header(parent_hash, parent);
+        provider.add_block(block_hash, block);
+
+        let recorder = ReplayContextRecorder::default();
+        let evm_config = recorder.evm_config(EthEvmConfig::new(provider.chain_spec()));
+        let eth_api =
+            EthApiBuilder::new(provider, testing_pool(), NoopNetwork::default(), evm_config)
+                .build();
+
+        <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api,
+            vec![
+                Bundle { transactions: Vec::new(), block_override: None },
+                Bundle { transactions: vec![TransactionRequest::default()], block_override: None },
+            ],
+            Some(StateContext {
+                block_number: Some(block_hash.into()),
+                transaction_index: Some(TransactionIndex::Index(1)),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let captures = recorder.captures();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].marker_balance, Some(U256::from(1)));
+        let seeds = recorder.seeds();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].marker_balance, Some(U256::from(1)));
+    }
+
+    #[tokio::test]
     async fn test_call_many_all_captures_genesis_context_from_genesis_state() {
         let provider = MockEthProvider::default().with_recovered_blocks();
         provider.add_account(CONTEXT_MARKER, ExtendedAccount::new(0, U256::from(1)));
