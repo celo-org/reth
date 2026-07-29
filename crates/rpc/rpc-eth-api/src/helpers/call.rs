@@ -342,6 +342,12 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 .await?
                 .ok_or(EthApiError::HeaderNotFound(target_block))?;
             let evm_env = self.evm_env_for_header(block.sealed_block().sealed_header())?;
+            let first_bundle_has_transactions =
+                bundles.first().is_some_and(|bundle| !bundle.transactions.is_empty());
+            let first_block_override =
+                bundles.first().and_then(|bundle| bundle.block_override.clone());
+            let first_bundle_has_overrides =
+                state_override.is_some() || first_block_override.is_some();
 
             // we're essentially replaying the transactions in the block here, hence we need the
             // state that points to the beginning of the block, which is the state at
@@ -359,8 +365,53 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 replay_block_txs = false;
             }
 
+            // The first bundle executes over the requested mid-block state, but block-scoped EVM
+            // context still comes from the target block's start. Capture it on a detached parent
+            // state so canonical prefix replay and caller overrides remain independent.
+            let initial_replay_ctx = if first_bundle_has_transactions &&
+                (!replay_block_txs || first_bundle_has_overrides)
+            {
+                let capture_block = block.clone();
+                let mut capture_env = evm_env.clone();
+                let capture_state_override = state_override.clone();
+                self.spawn_with_state_at_block(block.parent_hash(), move |this, mut db| {
+                    {
+                        let mut executor = RpcNodeCore::evm_config(&this)
+                            .executor_for_block(&mut db, capture_block.sealed_block())
+                            .map_err(RethError::other)
+                            .map_err(Self::Error::from_eth_err)?;
+                        executor
+                            .apply_pre_execution_changes()
+                            .map_err(Self::Error::from_eth_err)?;
+                    }
+                    if let Some(block_override) = first_block_override {
+                        apply_block_overrides(
+                            block_override,
+                            &mut db,
+                            capture_env.block_env.inner_mut(),
+                        );
+                    }
+                    if let Some(state_override) = capture_state_override {
+                        apply_state_overrides(state_override, &mut db)
+                            .map_err(EthApiError::from_state_overrides_err)
+                            .map_err(|err| {
+                                Self::Error::from_eth_err(EthApiError::call_many_error(
+                                    0,
+                                    0,
+                                    err.into(),
+                                ))
+                            })?;
+                    }
+                    Ok(this.evm_config().capture_block_replay_ctx(&mut db, &capture_env))
+                })
+                .await?
+            } else {
+                None
+            };
+
             self.spawn_with_state_at_block(at, move |this, mut db| {
                 let mut all_results = Vec::with_capacity(bundles.len());
+                let mut initial_replay_ctx = initial_replay_ctx;
 
                 if replay_block_txs {
                     let mut executor = RpcNodeCore::evm_config(&this)
@@ -368,6 +419,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         .map_err(RethError::other)
                         .map_err(Self::Error::from_eth_err)?;
                     executor.apply_pre_execution_changes().map_err(Self::Error::from_eth_err)?;
+                    if first_bundle_has_transactions && !first_bundle_has_overrides {
+                        initial_replay_ctx = this
+                            .evm_config()
+                            .capture_block_replay_ctx(executor.evm_mut().db_mut(), &evm_env);
+                    }
                     for tx in block.transactions_recovered().take(num_txs) {
                         executor.execute_transaction(tx).map_err(Self::Error::from_eth_err)?;
                     }
@@ -401,8 +457,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                                 ))
                             })?;
                     }
-                    let replay_ctx =
-                        this.evm_config().capture_block_replay_ctx(&mut db, &bundle_evm_env);
+                    let replay_ctx = if bundle_index == 0 {
+                        initial_replay_ctx.take()
+                    } else {
+                        this.evm_config().capture_block_replay_ctx(&mut db, &bundle_evm_env)
+                    };
 
                     // transact all transactions in the bundle
                     for (tx_index, tx) in transactions.into_iter().enumerate() {

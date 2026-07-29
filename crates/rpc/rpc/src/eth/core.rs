@@ -566,18 +566,19 @@ mod tests {
         test_utils::{ReplayContextRecorder, CONTEXT_MARKER},
         EthApi, EthApiBuilder,
     };
-    use alloy_consensus::{Block, BlockBody, Header};
+    use alloy_consensus::{transaction::SignerRecoverable, Block, BlockBody, Header, TxLegacy};
     use alloy_eips::BlockNumberOrTag;
-    use alloy_primitives::{Signature, B256, U256, U64};
+    use alloy_primitives::{Signature, TxKind, B256, U256, U64};
     use alloy_rpc_types::FeeHistory;
     use alloy_rpc_types_eth::{
-        state::StateOverridesBuilder, BlockOverrides, Bundle, StateContext, TransactionRequest,
+        state::StateOverridesBuilder, BlockOverrides, Bundle, StateContext, TransactionIndex,
+        TransactionRequest,
     };
     use jsonrpsee_types::error::INVALID_PARAMS_CODE;
     use rand::Rng;
     use reth_chain_state::CanonStateSubscriptions;
     use reth_chainspec::{ChainSpec, ChainSpecProvider, EthChainSpec};
-    use reth_ethereum_primitives::TransactionSigned;
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
     use reth_evm_ethereum::EthEvmConfig;
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::{
@@ -872,6 +873,71 @@ mod tests {
             recorder.seeds().into_iter().map(|ctx| ctx.id).collect::<Vec<_>>(),
             vec![0, 0, 1, 1]
         );
+    }
+
+    #[tokio::test]
+    async fn test_call_many_first_bundle_captures_context_before_prefix_replay() {
+        let provider = MockEthProvider::default().with_recovered_blocks();
+        provider.add_account(CONTEXT_MARKER, ExtendedAccount::new(0, U256::from(1)));
+
+        let prefix_tx = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy {
+                gas_limit: 21_000,
+                to: TxKind::Call(CONTEXT_MARKER),
+                value: U256::from(6),
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        let sender = prefix_tx.recover_signer().unwrap();
+        provider.add_account(sender, ExtendedAccount::new(0, U256::from(1_000_000)));
+
+        let parent = Header { number: 0, gas_limit: 30_000_000, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+        let trailing_tx = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy {
+                nonce: 1,
+                gas_limit: 21_000,
+                to: TxKind::Call(CONTEXT_MARKER),
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        let block = Block {
+            header: Header { number: 1, parent_hash, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody { transactions: vec![prefix_tx, trailing_tx], ..Default::default() },
+        };
+        let block_hash = block.header.hash_slow();
+        provider.add_header(parent_hash, parent);
+        provider.add_block(block_hash, block);
+
+        let recorder = ReplayContextRecorder::default();
+        let evm_config = recorder.evm_config(EthEvmConfig::new(provider.chain_spec()));
+        let eth_api =
+            EthApiBuilder::new(provider, testing_pool(), NoopNetwork::default(), evm_config)
+                .build();
+
+        <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api,
+            vec![Bundle {
+                transactions: vec![TransactionRequest::default()],
+                block_override: None,
+            }],
+            Some(StateContext {
+                block_number: Some(block_hash.into()),
+                transaction_index: Some(TransactionIndex::Index(1)),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let captures = recorder.captures();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].marker_balance, Some(U256::from(1)));
+        let seeds = recorder.seeds();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].marker_balance, Some(U256::from(1)));
     }
 
     #[tokio::test]
