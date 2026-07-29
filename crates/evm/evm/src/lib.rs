@@ -319,6 +319,11 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     /// here (invoked on the block-start state, before the block's transaction prefix is
     /// replayed) and re-apply it in [`ConfigureEvm::seed_block_replay_ctx`].
     ///
+    /// Call-many APIs may optimize `TransactionIndex::All` by executing calls on the target
+    /// block's final state without replaying its transactions. The captured context must still
+    /// come from that target block's start: block-scoped values are fixed when actual block
+    /// execution begins, even though the simulated calls observe the block's final database state.
+    ///
     /// The default implementation captures nothing.
     fn capture_block_replay_ctx<DB: Database>(
         &self,
