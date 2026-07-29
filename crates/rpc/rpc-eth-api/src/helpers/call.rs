@@ -332,10 +332,10 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 .await?
                 .ok_or(EthApiError::HeaderNotFound(target_block))?;
             let evm_env = self.evm_env_for_header(block.sealed_block().sealed_header())?;
-            let first_bundle_has_transactions =
-                bundles.first().is_some_and(|bundle| !bundle.transactions.is_empty());
-            let first_block_override =
-                bundles.first().and_then(|bundle| bundle.block_override.clone());
+            let first_non_empty_bundle_index =
+                bundles.iter().position(|bundle| !bundle.transactions.is_empty());
+            let first_block_override = first_non_empty_bundle_index
+                .and_then(|index| bundles[index].block_override.clone());
             let first_bundle_has_overrides =
                 state_override.is_some() || first_block_override.is_some();
 
@@ -358,7 +358,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             // The first bundle executes over the requested mid-block state, but block-scoped EVM
             // context still comes from the target block's start. Capture it on a detached parent
             // state so canonical prefix replay and caller overrides remain independent.
-            let initial_replay_ctx = if first_bundle_has_transactions &&
+            let initial_replay_ctx = if let Some(first_bundle_index) = first_non_empty_bundle_index &&
                 (!replay_block_txs || first_bundle_has_overrides)
             {
                 let capture_block = block.clone();
@@ -389,7 +389,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             .map_err(EthApiError::from_state_overrides_err)
                             .map_err(|err| {
                                 Self::Error::from_eth_err(EthApiError::call_many_error(
-                                    0,
+                                    first_bundle_index,
                                     0,
                                     err.into(),
                                 ))
@@ -407,7 +407,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 let mut initial_replay_ctx = initial_replay_ctx;
 
                 if replay_block_txs {
-                    if first_bundle_has_transactions && !first_bundle_has_overrides {
+                    if first_non_empty_bundle_index.is_some() && !first_bundle_has_overrides {
                         initial_replay_ctx =
                             this.replay_block_until_capturing_ctx(&mut db, &block, num_txs, true)?;
                     } else {
@@ -443,7 +443,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                                 ))
                             })?;
                     }
-                    let replay_ctx = if bundle_index == 0 {
+                    let replay_ctx = if Some(bundle_index) == first_non_empty_bundle_index {
                         initial_replay_ctx.take()
                     } else {
                         this.evm_config().capture_block_replay_ctx(&mut db, &bundle_evm_env)
