@@ -362,10 +362,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 (!replay_block_txs || first_bundle_has_overrides)
             {
                 let capture_block = block.clone();
+                let capture_from_genesis = block.number() == 0;
+                let capture_at =
+                    if capture_from_genesis { block.hash() } else { block.parent_hash() };
                 let mut capture_env = evm_env.clone();
                 let capture_state_override = state_override.clone();
-                self.spawn_with_state_at_block(block.parent_hash(), move |this, mut db| {
-                    {
+                self.spawn_with_state_at_block(capture_at, move |this, mut db| {
+                    if !capture_from_genesis {
                         let mut executor = RpcNodeCore::evm_config(&this)
                             .executor_for_block(&mut db, capture_block.sealed_block())
                             .map_err(RethError::other)

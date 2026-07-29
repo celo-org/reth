@@ -471,32 +471,37 @@ where
         // first simulated bundle still needs block-scoped context from the target block's start.
         // A detached parent-state read preserves the final-state optimization. Caller overrides
         // also need detached capture so canonical prefix replay remains untouched.
-        let initial_replay_ctx =
-            if first_bundle_has_transactions && (!replay_block_txs || first_bundle_has_overrides) {
-                let capture_block = block.clone();
-                let mut capture_env = evm_env.clone();
-                let capture_state_overrides = state_overrides.clone();
-                self.eth_api()
-                    .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
+        let initial_replay_ctx = if first_bundle_has_transactions &&
+            (!replay_block_txs || first_bundle_has_overrides)
+        {
+            let capture_block = block.clone();
+            let capture_from_genesis = block.number() == 0;
+            let capture_at = if capture_from_genesis { block.hash() } else { block.parent_hash() };
+            let mut capture_env = evm_env.clone();
+            let capture_state_overrides = state_overrides.clone();
+            self.eth_api()
+                .spawn_with_state_at_block(capture_at, move |eth_api, mut db| {
+                    if !capture_from_genesis {
                         eth_api.apply_pre_execution_changes(&capture_block, &mut db)?;
-                        if let Some(block_override) = first_block_override {
-                            apply_block_overrides(
-                                block_override,
-                                &mut db,
-                                capture_env.block_env.inner_mut(),
-                            );
-                        }
-                        if let Some(state_overrides) = capture_state_overrides {
-                            apply_state_overrides(state_overrides, &mut db)
-                                .map_err(EthApiError::from_state_overrides_err)
-                                .map_err(Eth::Error::from_eth_err)?;
-                        }
-                        Ok(eth_api.evm_config().capture_block_replay_ctx(&mut db, &capture_env))
-                    })
-                    .await?
-            } else {
-                None
-            };
+                    }
+                    if let Some(block_override) = first_block_override {
+                        apply_block_overrides(
+                            block_override,
+                            &mut db,
+                            capture_env.block_env.inner_mut(),
+                        );
+                    }
+                    if let Some(state_overrides) = capture_state_overrides {
+                        apply_state_overrides(state_overrides, &mut db)
+                            .map_err(EthApiError::from_state_overrides_err)
+                            .map_err(Eth::Error::from_eth_err)?;
+                    }
+                    Ok(eth_api.evm_config().capture_block_replay_ctx(&mut db, &capture_env))
+                })
+                .await?
+        } else {
+            None
+        };
 
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
@@ -1501,8 +1506,23 @@ mod tests {
         RpcConverter<Ethereum, CountingEvmConfig, EthReceiptConverter<ChainSpec>>,
     >;
 
+    struct CountingFixture {
+        api: DebugApi<CountingEthApi>,
+        captures: Arc<AtomicUsize>,
+        seeds: Arc<AtomicUsize>,
+        captured_ctxs: Arc<Mutex<Vec<CapturedCtx>>>,
+        seeded_ctxs: Arc<Mutex<Vec<CapturedCtx>>>,
+        history_state_lookups: Arc<parking_lot::Mutex<Vec<B256>>>,
+        parent_hash: B256,
+        block_hash: B256,
+    }
+
     /// Builds a [`DebugApi`] over a mock one-transaction block at height 1.
     fn counting_debug_api() -> CountingFixture {
+        counting_debug_api_at(1, true)
+    }
+
+    fn counting_debug_api_at(block_number: u64, has_block_transaction: bool) -> CountingFixture {
         let provider = MockEthProvider::default();
         provider.add_account(MARKER, ExtendedAccount::new(0, U256::from(1)));
         provider.add_account(
@@ -1512,22 +1532,38 @@ mod tests {
             ])),
         );
 
-        let parent = Header { number: 0, gas_limit: 30_000_000, ..Default::default() };
-        let parent_hash = parent.hash_slow();
-        let tx = TransactionSigned::new_unhashed(
-            Transaction::Legacy(TxLegacy {
-                gas_limit: 21_000,
-                to: TxKind::Call(Address::ZERO),
-                ..Default::default()
-            }),
-            Signature::test_signature(),
-        );
+        let parent = Header {
+            number: block_number.saturating_sub(1),
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let parent_hash = if block_number == 0 { B256::ZERO } else { parent.hash_slow() };
+        let transactions = has_block_transaction
+            .then(|| {
+                TransactionSigned::new_unhashed(
+                    Transaction::Legacy(TxLegacy {
+                        gas_limit: 21_000,
+                        to: TxKind::Call(Address::ZERO),
+                        ..Default::default()
+                    }),
+                    Signature::test_signature(),
+                )
+            })
+            .into_iter()
+            .collect();
         let block = reth_ethereum_primitives::Block {
-            header: Header { number: 1, parent_hash, gas_limit: 30_000_000, ..Default::default() },
-            body: alloy_consensus::BlockBody { transactions: vec![tx], ..Default::default() },
+            header: Header {
+                number: block_number,
+                parent_hash,
+                gas_limit: 30_000_000,
+                ..Default::default()
+            },
+            body: alloy_consensus::BlockBody { transactions, ..Default::default() },
         };
         let block_hash = block.header.hash_slow();
-        provider.add_header(parent_hash, parent);
+        if block_number > 0 {
+            provider.add_header(parent_hash, parent);
+        }
         provider.add_block(block_hash, block);
 
         let captures = Arc::new(AtomicUsize::new(0));
@@ -1649,6 +1685,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn trace_call_many_all_captures_genesis_context_from_genesis_state() {
+        let f = counting_debug_api_at(0, false);
+
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+        let context =
+            StateContext { block_number: Some(f.block_hash.into()), transaction_index: None };
+        f.api.debug_trace_call_many(bundles, Some(context), None).await.unwrap();
+
+        let captured = f.captured_ctxs.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].lookup_hash, Some(f.block_hash));
+        drop(captured);
+
+        let lookups = f.history_state_lookups.lock();
+        assert_eq!(lookups.as_slice(), &[f.block_hash, f.block_hash]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn trace_call_many_empty_state_overrides_keep_bundle_context_pinned() {
         let f = counting_debug_api();
 
@@ -1718,17 +1775,6 @@ mod tests {
         assert_eq!(seeded.len(), 1);
         assert_eq!(seeded[0].lookup_hash, Some(f.parent_hash));
         assert_eq!(seeded[0].marker_balance, Some(U256::from(7)));
-    }
-
-    struct CountingFixture {
-        api: DebugApi<CountingEthApi>,
-        captures: Arc<AtomicUsize>,
-        seeds: Arc<AtomicUsize>,
-        captured_ctxs: Arc<Mutex<Vec<CapturedCtx>>>,
-        seeded_ctxs: Arc<Mutex<Vec<CapturedCtx>>>,
-        history_state_lookups: Arc<parking_lot::Mutex<Vec<B256>>>,
-        parent_hash: B256,
-        block_hash: B256,
     }
 
     #[tokio::test(flavor = "multi_thread")]
