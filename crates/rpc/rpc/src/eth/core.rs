@@ -941,6 +941,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_call_many_all_captures_genesis_context_from_genesis_state() {
+        let provider = MockEthProvider::default().with_recovered_blocks();
+        provider.add_account(CONTEXT_MARKER, ExtendedAccount::new(0, U256::from(1)));
+
+        let block = Block {
+            header: Header { number: 0, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody::default(),
+        };
+        let block_hash = block.header.hash_slow();
+        provider.add_block(block_hash, block);
+
+        let history_state_lookups = provider.history_state_lookups.clone();
+        let recorder = ReplayContextRecorder::default();
+        let evm_config = recorder.evm_config(EthEvmConfig::new(provider.chain_spec()));
+        let eth_api =
+            EthApiBuilder::new(provider, testing_pool(), NoopNetwork::default(), evm_config)
+                .build();
+
+        <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api,
+            vec![Bundle {
+                transactions: vec![TransactionRequest::default()],
+                block_override: None,
+            }],
+            Some(StateContext { block_number: Some(block_hash.into()), transaction_index: None }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recorder.captures().len(), 1);
+        assert_eq!(recorder.seeds().len(), 1);
+        assert_eq!(history_state_lookups.lock().as_slice(), &[block_hash, block_hash]);
+    }
+
+    #[tokio::test]
     /// Requesting no block should result in a default response
     async fn test_fee_history_no_block_requested() {
         let block_count = 10;
