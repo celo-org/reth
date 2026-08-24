@@ -498,7 +498,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
             let mut inspector = AccessListInspector::new(initial);
 
-            let result = this.inspect(&mut db, evm_env.clone(), tx_env.clone(), &mut inspector)?;
+            // `Trace::inspect` only accepts a `StateCacheDb`, while this method builds its own
+            // `State` over a `StateProviderBox`, so run the inspected transaction directly.
+            let result = this
+                .evm_config()
+                .evm_with_env_and_inspector(&mut db, evm_env.clone(), &mut inspector)
+                .transact(tx_env.clone())
+                .map_err(Self::Error::from_evm_err)?;
             let access_list = inspector.into_access_list();
             let gas_used = result.result.tx_gas_used();
             tx_env.set_access_list(access_list.clone());
