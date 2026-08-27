@@ -69,6 +69,23 @@ pub struct StateRootComputeOutcome {
     pub debug_recorders: Vec<(Option<B256>, reth_trie_sparse::debug_recorder::TrieDebugRecorder)>,
 }
 
+/// Keeps the background sparse trie task alive while its result may still be consumed.
+///
+/// Dropping this guard disconnects the paired receiver. The task observes that disconnect at its
+/// next channel wait and stops work whose result is no longer needed.
+#[derive(Debug)]
+pub struct StateRootTaskCancelGuard {
+    _sender: crossbeam_channel::Sender<()>,
+}
+
+impl StateRootTaskCancelGuard {
+    /// Creates a cancellation guard and its paired receiver.
+    pub fn channel() -> (Self, crossbeam_channel::Receiver<()>) {
+        let (tx, rx) = crossbeam_channel::bounded(0);
+        (Self { _sender: tx }, rx)
+    }
+}
+
 /// Handle to a background sparse trie state root computation.
 ///
 /// Used by both the engine (during `newPayload`) and the payload builder (during `FCU`-triggered
@@ -82,6 +99,8 @@ pub struct StateRootHandle {
     cached_trie_state_root: B256,
     /// Channel for streaming state updates and proof targets into the sparse trie pipeline.
     updates_tx: crossbeam_channel::Sender<StateRootMessage>,
+    /// Signals when the state root result is no longer needed.
+    _cancel_guard: Option<StateRootTaskCancelGuard>,
     /// Receiver for the final state root result.
     state_root_rx:
         Option<std::sync::mpsc::Receiver<Result<StateRootComputeOutcome, ParallelStateRootError>>>,
@@ -96,7 +115,18 @@ impl StateRootHandle {
             Result<StateRootComputeOutcome, ParallelStateRootError>,
         >,
     ) -> Self {
-        Self { cached_trie_state_root, updates_tx, state_root_rx: Some(state_root_rx) }
+        Self {
+            cached_trie_state_root,
+            updates_tx,
+            _cancel_guard: None,
+            state_root_rx: Some(state_root_rx),
+        }
+    }
+
+    /// Attaches a guard that cancels the background task when this handle is dropped.
+    pub fn with_cancel_guard(mut self, cancel_guard: StateRootTaskCancelGuard) -> Self {
+        self._cancel_guard = Some(cancel_guard);
+        self
     }
 
     /// Returns the state root that the cached sparse trie is anchored at.
@@ -198,4 +228,25 @@ pub fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
     }
 
     hashed_state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_handle_disconnects_cancel_channel_after_receiver_taken() {
+        let (updates_tx, _updates_rx) = crossbeam_channel::unbounded();
+        let (_state_root_tx, state_root_rx) =
+            std::sync::mpsc::channel::<Result<StateRootComputeOutcome, ParallelStateRootError>>();
+        let (cancel_guard, cancel_rx) = StateRootTaskCancelGuard::channel();
+        let mut handle = StateRootHandle::new(B256::ZERO, updates_tx, state_root_rx)
+            .with_cancel_guard(cancel_guard);
+
+        let _state_root_rx = handle.take_state_root_rx();
+        assert!(matches!(cancel_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+
+        drop(handle);
+        assert!(matches!(cancel_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    }
 }

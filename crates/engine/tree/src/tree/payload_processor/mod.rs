@@ -381,16 +381,19 @@ where
         let proof_handle = ProofWorkerHandle::new(&self.executor, task_ctx, halve_workers);
 
         let (state_root_tx, state_root_rx) = channel();
+        let (cancel_guard, cancel_rx) = StateRootTaskCancelGuard::channel();
 
         self.spawn_sparse_trie_task(
             proof_handle,
             state_root_tx,
             from_multi_proof,
+            cancel_rx,
             parent_state_root,
             config.multiproof_chunk_size(),
         );
 
         StateRootHandle::new(parent_state_root, updates_tx, state_root_rx)
+            .with_cancel_guard(cancel_guard)
     }
 
     /// Transaction count threshold below which proof workers are halved, since fewer transactions
@@ -581,6 +584,7 @@ where
         proof_worker_handle: ProofWorkerHandle,
         state_root_tx: mpsc::Sender<Result<StateRootComputeOutcome, ParallelStateRootError>>,
         from_multi_proof: CrossbeamReceiver<StateRootMessage>,
+        cancel_rx: CrossbeamReceiver<()>,
         parent_state_root: B256,
         chunk_size: usize,
     ) {
@@ -627,7 +631,10 @@ where
 
             let mut task = SparseTrieCacheTask::new_with_trie(
                 &executor,
-                from_multi_proof,
+                sparse_trie::SparseTrieTaskChannels {
+                    updates: from_multi_proof,
+                    cancel: cancel_rx,
+                },
                 proof_worker_handle,
                 trie_metrics.clone(),
                 sparse_state_trie,

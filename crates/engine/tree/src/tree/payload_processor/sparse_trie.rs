@@ -37,6 +37,12 @@ use tracing::{debug, debug_span, error, instrument, trace_span};
 /// Maximum number of pending/prewarm updates that we accumulate in memory before actually applying.
 const MAX_PENDING_UPDATES: usize = 100;
 
+/// Channels that connect execution and payload lifecycle events to the sparse trie task.
+pub(super) struct SparseTrieTaskChannels {
+    pub(super) updates: CrossbeamReceiver<StateRootMessage>,
+    pub(super) cancel: CrossbeamReceiver<()>,
+}
+
 /// Sparse trie task implementation that uses in-memory sparse trie data to schedule proof fetching.
 pub(super) struct SparseTrieCacheTask<A = ConfigurableSparseTrie, S = ConfigurableSparseTrie> {
     /// Sender for proof results.
@@ -45,6 +51,8 @@ pub(super) struct SparseTrieCacheTask<A = ConfigurableSparseTrie, S = Configurab
     proof_result_rx: CrossbeamReceiver<ProofResultMessage>,
     /// Receives updates from execution and prewarming.
     updates: CrossbeamReceiver<SparseTrieTaskMessage>,
+    /// Signals when the consumer no longer needs this task's result.
+    cancel_rx: CrossbeamReceiver<()>,
     /// `SparseStateTrie` used for computing the state root.
     trie: SparseStateTrie<A, S>,
     /// The parent block's state root.
@@ -119,7 +127,7 @@ where
     /// Creates a new sparse trie, pre-populating with an existing [`SparseStateTrie`].
     pub(super) fn new_with_trie(
         executor: &Runtime,
-        updates: CrossbeamReceiver<StateRootMessage>,
+        channels: SparseTrieTaskChannels,
         proof_worker_handle: ProofWorkerHandle,
         metrics: MultiProofTaskMetrics,
         trie: SparseStateTrie<A, S>,
@@ -133,13 +141,14 @@ where
         let hashing_metrics = metrics.clone();
         executor.spawn_blocking_named("trie-hashing", move || {
             let _span = trace_span!(parent: parent_span, "run_hashing_task").entered();
-            Self::run_hashing_task(updates, hashed_state_tx, hashing_metrics)
+            Self::run_hashing_task(channels.updates, hashed_state_tx, hashing_metrics)
         });
 
         Self {
             proof_result_tx,
             proof_result_rx,
             updates: hashed_state_rx,
+            cancel_rx: channels.cancel,
             proof_worker_handle,
             trie,
             parent_state_root,
@@ -270,6 +279,11 @@ where
         loop {
             let mut t = Instant::now();
             crossbeam_channel::select_biased! {
+                recv(self.cancel_rx) -> _ => {
+                    return Err(ParallelStateRootError::Other(
+                        "sparse trie task cancelled".to_string(),
+                    ));
+                }
                 recv(self.updates) -> message => {
                     let wake = Instant::now();
 
@@ -899,7 +913,7 @@ mod tests {
         ChainSpecProvider,
     };
     use reth_trie_db::ChangesetCache;
-    use reth_trie_parallel::proof_task::ProofTaskCtx;
+    use reth_trie_parallel::{proof_task::ProofTaskCtx, state_root_task::StateRootTaskCancelGuard};
     use reth_trie_sparse::ArenaParallelSparseTrie;
 
     #[test]
@@ -1006,9 +1020,10 @@ mod tests {
 
         let parent_state_root = B256::from([0x55; 32]);
         let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+        let (_cancel_guard, cancel_rx) = StateRootTaskCancelGuard::channel();
         let mut task = SparseTrieCacheTask::new_with_trie(
             &runtime,
-            updates_rx,
+            SparseTrieTaskChannels { updates: updates_rx, cancel: cancel_rx },
             proof_worker_handle,
             MultiProofTaskMetrics::default(),
             trie,
@@ -1024,5 +1039,49 @@ mod tests {
         assert_eq!(outcome.state_root, parent_state_root);
         assert!(outcome.trie_updates.is_empty());
         assert!(task.trie.state_trie_ref().is_none(), "blind trie should not be revealed");
+    }
+
+    #[test]
+    fn run_errors_when_cancel_guard_drops_before_updates_finish() {
+        let runtime = reth_tasks::Runtime::test();
+        let provider_factory = create_test_provider_factory();
+        let anchor_hash = provider_factory.chain_spec().genesis_hash();
+        let overlay_factory = OverlayStateProviderFactory::new(
+            provider_factory,
+            OverlayBuilder::<reth_chain_state::EthPrimitives>::new(
+                anchor_hash,
+                ChangesetCache::new(),
+            ),
+        );
+        let proof_worker_handle =
+            ProofWorkerHandle::new(&runtime, ProofTaskCtx::new(overlay_factory), false);
+
+        let default_trie = RevealableSparseTrie::blind_from(ConfigurableSparseTrie::Arena(
+            ArenaParallelSparseTrie::default(),
+        ));
+        let trie = SparseStateTrie::default()
+            .with_accounts_trie(default_trie.clone())
+            .with_default_storage_trie(default_trie)
+            .with_updates(true);
+
+        let (_updates_tx, updates_rx) = crossbeam_channel::unbounded();
+        let (cancel_guard, cancel_rx) = StateRootTaskCancelGuard::channel();
+        let mut task = SparseTrieCacheTask::new_with_trie(
+            &runtime,
+            SparseTrieTaskChannels { updates: updates_rx, cancel: cancel_rx },
+            proof_worker_handle,
+            MultiProofTaskMetrics::default(),
+            trie,
+            B256::ZERO,
+            1,
+        );
+
+        drop(cancel_guard);
+
+        let result = task.run();
+        assert!(matches!(
+            result,
+            Err(ParallelStateRootError::Other(message)) if message == "sparse trie task cancelled"
+        ));
     }
 }
