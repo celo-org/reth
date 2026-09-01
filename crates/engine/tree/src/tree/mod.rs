@@ -3253,7 +3253,9 @@ where
             None
         };
 
-        let trie_handle = if self.config.share_sparse_trie_with_payload_builder() {
+        let trie_handle = if self.config.share_sparse_trie_with_payload_builder() &&
+            self.config.use_state_root_task()
+        {
             self.payload_validator.sparse_trie_handle_for(
                 state.head_block_hash,
                 head.state_root(),
