@@ -647,13 +647,19 @@ pub trait Call:
     fn evm_memory_limit(&self) -> u64;
 
     /// Returns the max gas limit that the caller can afford given a transaction environment.
+    ///
+    /// Delegates to [`ConfigureEvm::caller_gas_allowance`], so a chain whose transactions can
+    /// pay the fee in an asset other than the native one caps the estimate by that asset's
+    /// balance.
     fn caller_gas_allowance(
         &self,
-        mut db: impl Database<Error: Into<EthApiError>>,
-        _evm_env: &EvmEnvFor<Self::Evm>,
+        mut db: impl Database<Error: Into<EthApiError>> + fmt::Debug,
+        evm_env: &EvmEnvFor<Self::Evm>,
         tx_env: &TxEnvFor<Self::Evm>,
     ) -> Result<u64, Self::Error> {
-        alloy_evm::call::caller_gas_allowance(&mut db, tx_env).map_err(Self::Error::from_eth_err)
+        self.evm_config()
+            .caller_gas_allowance(&mut db, evm_env, tx_env)
+            .map_err(Self::Error::from_eth_err)
     }
 
     /// Executes the closure with the state that corresponds to the given [`BlockId`].
@@ -965,7 +971,7 @@ pub trait Call:
         overrides: EvmOverrides,
     ) -> Result<(EvmEnvFor<Self::Evm>, TxEnvFor<Self::Evm>), Self::Error>
     where
-        DB: Database + DatabaseCommit + OverrideBlockHashes,
+        DB: Database + DatabaseCommit + OverrideBlockHashes + fmt::Debug,
         EthApiError: From<<DB as Database>::Error>,
     {
         // track whether the request has a gas limit set
