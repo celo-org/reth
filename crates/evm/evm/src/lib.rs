@@ -24,14 +24,14 @@ use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     precompiles::PrecompilesMap,
 };
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use core::{any::Any, error::Error, fmt::Debug};
 use execute::{BasicBlockExecutor, BlockAssembler, BlockBuilder};
 use reth_execution_errors::BlockExecutionError;
 use reth_primitives_traits::{
     BlockTy, HeaderTy, NodePrimitives, ReceiptTy, SealedBlock, SealedHeader, TxTy,
 };
-use revm::{database::State, primitives::hardfork::SpecId};
+use revm::{context_interface::Transaction, database::State, primitives::hardfork::SpecId};
 
 pub mod either;
 /// EVM environment configuration.
@@ -56,6 +56,34 @@ pub use alloy_evm::{
     block::{state_changes, system_calls, OnStateHook},
     *,
 };
+
+/// Error returned by [`ConfigureEvm::caller_gas_allowance`].
+#[derive(Debug, derive_more::Display)]
+pub enum CallerGasAllowanceError<DBError> {
+    /// Reading the caller's account failed.
+    #[display("{_0}")]
+    Database(DBError),
+    /// The caller's balance does not cover the transferred value.
+    #[display("insufficient funds: cost {cost} > balance {balance}")]
+    InsufficientFunds {
+        /// Transferred value.
+        cost: U256,
+        /// Caller balance.
+        balance: U256,
+    },
+    /// A chain-specific lookup of the balance the fee is paid from failed.
+    #[display("failed to read the caller's fee balance: {_0}")]
+    FeeBalance(String),
+}
+
+impl<DBError: Error + 'static> Error for CallerGasAllowanceError<DBError> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Database(err) => Some(err),
+            Self::InsufficientFunds { .. } | Self::FeeBalance(_) => None,
+        }
+    }
+}
 
 /// A complete configuration of EVM for Reth.
 ///
@@ -376,6 +404,34 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         DB: Database,
         I: InspectorFor<Self, DB>,
     {
+    }
+
+    /// Returns the highest gas limit `tx_env`'s caller can pay for at its gas price.
+    ///
+    /// `eth_estimateGas` and `eth_call` cap a request that carries a gas price but no gas limit
+    /// at this value. The default divides the caller's native balance, less the transferred
+    /// value, by the gas price; with a zero gas price it returns zero. Chains whose transactions
+    /// can pay the fee in another asset override it so the allowance comes from that asset's
+    /// balance.
+    fn caller_gas_allowance<DB: Database>(
+        &self,
+        db: &mut DB,
+        _evm_env: &EvmEnvFor<Self>,
+        tx_env: &TxEnvFor<Self>,
+    ) -> Result<u64, CallerGasAllowanceError<DB::Error>> {
+        let balance = db
+            .basic(Transaction::caller(tx_env))
+            .map_err(CallerGasAllowanceError::Database)?
+            .map(|account| account.balance)
+            .unwrap_or_default();
+        let value = Transaction::value(tx_env);
+        let spendable = balance
+            .checked_sub(value)
+            .ok_or(CallerGasAllowanceError::InsufficientFunds { cost: value, balance })?;
+        Ok(spendable
+            .checked_div(U256::from(Transaction::gas_price(tx_env)))
+            .unwrap_or_default()
+            .saturating_to())
     }
 
     /// Creates a strategy with given EVM and execution context.
