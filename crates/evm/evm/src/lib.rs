@@ -22,6 +22,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
+    call::{CallError, InsufficientFundsError},
     precompiles::PrecompilesMap,
 };
 use alloy_primitives::{Address, Bytes, B256};
@@ -56,6 +57,39 @@ pub use alloy_evm::{
     block::{state_changes, system_calls, OnStateHook},
     *,
 };
+
+/// Error returned by [`ConfigureEvm::caller_gas_allowance`].
+#[derive(Debug, derive_more::Display)]
+pub enum CallerGasAllowanceError<DBError> {
+    /// Reading the caller's account failed.
+    #[display("{_0}")]
+    Database(DBError),
+    /// The caller's balance does not cover the transferred value.
+    #[display("{_0}")]
+    InsufficientFunds(InsufficientFundsError),
+    /// A chain-specific lookup of the balance the fee is paid from failed.
+    #[display("failed to read the caller's fee balance: {_0}")]
+    FeeBalance(String),
+}
+
+impl<DBError: Error + 'static> Error for CallerGasAllowanceError<DBError> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Database(err) => Some(err),
+            Self::InsufficientFunds(err) => Some(err),
+            Self::FeeBalance(_) => None,
+        }
+    }
+}
+
+impl<DBError> From<CallError<DBError>> for CallerGasAllowanceError<DBError> {
+    fn from(err: CallError<DBError>) -> Self {
+        match err {
+            CallError::Database(err) => Self::Database(err),
+            CallError::InsufficientFunds(err) => Self::InsufficientFunds(err),
+        }
+    }
+}
 
 /// A complete configuration of EVM for Reth.
 ///
@@ -376,6 +410,22 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         DB: Database,
         I: InspectorFor<Self, DB>,
     {
+    }
+
+    /// Returns the highest gas limit `tx_env`'s caller can pay for at its gas price.
+    ///
+    /// `eth_estimateGas` and `eth_call` cap a request that carries a gas price but no gas limit
+    /// at this value. The default divides the caller's native balance, less the transferred
+    /// value, by the gas price ([`alloy_evm::call::caller_gas_allowance`]). Chains whose
+    /// transactions can pay the fee in another asset override it so the allowance comes from
+    /// that asset's balance.
+    fn caller_gas_allowance<DB: Database>(
+        &self,
+        db: &mut DB,
+        _evm_env: &EvmEnvFor<Self>,
+        tx_env: &TxEnvFor<Self>,
+    ) -> Result<u64, CallerGasAllowanceError<DB::Error>> {
+        alloy_evm::call::caller_gas_allowance(db, tx_env).map_err(Into::into)
     }
 
     /// Creates a strategy with given EVM and execution context.

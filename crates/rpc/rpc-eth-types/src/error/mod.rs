@@ -10,6 +10,7 @@ use alloy_transport::{RpcError, TransportErrorKind};
 pub use api::{AsEthApiError, FromEthApiError, FromEvmError, IntoEthApiError};
 use core::time::Duration;
 use reth_errors::{BlockExecutionError, BlockValidationError, RethError};
+use reth_evm::CallerGasAllowanceError;
 use reth_primitives_traits::transaction::{error::InvalidTransactionError, signed::RecoveryError};
 use reth_revm::db::bal::EvmDatabaseError;
 use reth_rpc_convert::{CallFeesError, EthTxEnvError, TransactionConversionError};
@@ -368,6 +369,24 @@ where
                     balance: insufficient_funds_error.balance,
                 })
             }
+        }
+    }
+}
+
+impl<E> From<CallerGasAllowanceError<E>> for EthApiError
+where
+    E: Into<Self>,
+{
+    fn from(value: CallerGasAllowanceError<E>) -> Self {
+        match value {
+            CallerGasAllowanceError::Database(err) => err.into(),
+            CallerGasAllowanceError::InsufficientFunds(insufficient_funds_error) => {
+                Self::InvalidTransaction(RpcInvalidTransactionError::InsufficientFunds {
+                    cost: insufficient_funds_error.cost,
+                    balance: insufficient_funds_error.balance,
+                })
+            }
+            CallerGasAllowanceError::FeeBalance(msg) => Self::EvmCustom(msg),
         }
     }
 }
