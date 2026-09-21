@@ -4840,4 +4840,125 @@ mod tests {
         assert_eq!(t2.id().nonce, 2, "expected nonce 2, got {}", t2.id().nonce);
         assert_eq!(t3.id().nonce, 3, "expected nonce 3, got {}", t3.id().nonce);
     }
+
+    /// Applies a canonical state change that tracks `base_fee`, with nothing mined and no changed
+    /// senders, so that `AllTransactions::update` runs over the whole pool.
+    fn canonical_update_at_base_fee<T: TransactionOrdering>(pool: &mut TxPool<T>, base_fee: u64) {
+        let mut block_info = pool.block_info();
+        block_info.last_seen_block_number += 1;
+        block_info.pending_basefee = base_fee;
+        pool.on_canonical_state_change(
+            block_info,
+            Vec::new(),
+            FxHashMap::default(),
+            PoolUpdateKind::Commit,
+        );
+    }
+
+    fn pool_entry<'a, T: TransactionOrdering>(
+        pool: &'a TxPool<T>,
+        id: &TransactionId,
+    ) -> &'a PoolInternalTransaction<T::Transaction> {
+        pool.all_transactions.txs.get(id).expect("transaction is in the pool")
+    }
+
+    /// Guards the sub-pool a gap-filled descendant lands in.
+    ///
+    /// A base fee rise rechecks the pending sub-pool, and the all-transactions pass skips a sender
+    /// that still has a nonce gap, so a transaction parked in `Queued` carries the fee-cap bit it
+    /// was given at insertion. Closing the gap therefore has to evaluate it against the tracked
+    /// base fee, and a descendant the recheck demotes has to count as a parked ancestor for the
+    /// transactions behind it. A transaction priced below the base fee that reaches the pending
+    /// sub-pool is fatal for a sequencer: `best_transactions_with_attributes` returns that
+    /// sub-pool unfiltered when the requested fees equal the tracked ones, and op-reth's payload
+    /// builder unwraps `effective_tip_per_gas(base_fee)` for every transaction the iterator
+    /// yields.
+    ///
+    /// Sub-pool and state assertions read the pool's internals; the builder's view comes from
+    /// `best_transactions_with_attributes`.
+    #[test]
+    fn gap_filled_descendant_below_base_fee_is_not_yielded_as_best() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+        let sender = address!("0x000000000000000000000000000000000000000a");
+
+        canonical_update_at_base_fee(&mut pool, 200);
+
+        // Both descendants are nonce-gapped: the sender has nothing at nonce 0. Nonce 1 covers the
+        // tracked base fee of 200, nonce 2 is priced far above it.
+        let parked = f.validated(
+            MockTransaction::eip1559()
+                .with_sender(sender)
+                .with_nonce(1)
+                .with_max_fee(208)
+                .inc_limit(),
+        );
+        let parked_id = *parked.id();
+        pool.add_transaction(parked, U256::MAX, 0, None).unwrap();
+
+        let behind_parked = f.validated(
+            MockTransaction::eip1559()
+                .with_sender(sender)
+                .with_nonce(2)
+                .with_max_fee(300)
+                .inc_limit(),
+        );
+        let behind_parked_id = *behind_parked.id();
+        pool.add_transaction(behind_parked, U256::MAX, 0, None).unwrap();
+
+        assert_eq!(pool_entry(&pool, &parked_id).subpool, SubPool::Queued);
+        assert_eq!(pool_entry(&pool, &behind_parked_id).subpool, SubPool::Queued);
+
+        // The base fee rises past nonce 1's cap and then stays there for several blocks. Every one
+        // of these passes skips this sender while it is nonce-gapped.
+        let base_fee = 209;
+        for _ in 0..4 {
+            canonical_update_at_base_fee(&mut pool, base_fee);
+        }
+
+        // Nonce 0 covers the raised base fee and closes the gap.
+        let gap_filler = f.validated(
+            MockTransaction::eip1559()
+                .with_sender(sender)
+                .with_nonce(0)
+                .with_max_fee(210)
+                .inc_limit(),
+        );
+        let gap_filler_id = *gap_filler.id();
+        pool.add_transaction(gap_filler, U256::MAX, 0, None).unwrap();
+
+        // Asking for the tracked base fee and blob fee takes the arm that returns the pending
+        // sub-pool unfiltered, which is what a sequencer building on the tracked block does.
+        let blob_fee = pool.all_transactions.pending_fees.blob_fee as u64;
+        let best = pool
+            .best_transactions_with_attributes(BestTransactionsAttributes::new(
+                base_fee,
+                Some(blob_fee),
+            ))
+            .collect::<Vec<_>>();
+        for tx in &best {
+            assert!(
+                tx.transaction.effective_tip_per_gas(base_fee).is_some(),
+                "nonce {} is yielded to the builder but priced below the requested base fee",
+                tx.id().nonce
+            );
+        }
+        assert_eq!(best.iter().map(|tx| *tx.id()).collect::<Vec<_>>(), vec![gap_filler_id]);
+
+        let parked_entry = pool_entry(&pool, &parked_id);
+        assert_eq!(parked_entry.subpool, SubPool::BaseFee);
+        assert!(!parked_entry.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+        // Nonce 2 covers the base fee, but it sits behind a parked ancestor.
+        assert_eq!(pool_entry(&pool, &behind_parked_id).subpool, SubPool::Queued);
+        assert!(!pool.pending_pool.contains(&parked_id));
+        assert!(!pool.pending_pool.contains(&behind_parked_id));
+
+        // A base fee back at nonce 1's cap must not leave either transaction stranded. Nonce 2
+        // follows one pass later, because `AllTransactions::update` evaluates the ancestor
+        // condition before its own fee recheck.
+        canonical_update_at_base_fee(&mut pool, 208);
+        assert_eq!(pool_entry(&pool, &parked_id).subpool, SubPool::Pending);
+        canonical_update_at_base_fee(&mut pool, 208);
+        assert_eq!(pool_entry(&pool, &behind_parked_id).subpool, SubPool::Pending);
+    }
 }
