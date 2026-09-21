@@ -2096,6 +2096,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
         // The next transaction of this sender
         let on_chain_id = TransactionId::new(transaction.sender_id(), on_chain_nonce);
+        let pending_block_base_fee = self.pending_fees.base_fee;
         {
             // Tracks the next nonce we expect if the transactions are gapless
             let mut next_nonce = on_chain_id.nonce;
@@ -2137,10 +2138,16 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 } else {
                     tx.state.insert(TxState::NO_PARKED_ANCESTORS);
                 }
-                has_parked_ancestor = !tx.state.is_pending();
+
+                // Backport of paradigmxyz/reth#26956 (280a76318d): recheck the fee cap before
+                // deriving the sub-pool, and only afterwards record whether this transaction parks
+                // the ones behind it. Upstream does the recheck in `update_tx_fees`. Drop this
+                // backport when the fork is rebuilt on a reth revision that contains that PR.
+                Self::update_tx_base_fee(pending_block_base_fee, tx);
 
                 // update the pool based on the state
                 tx.subpool = tx.state.into();
+                has_parked_ancestor = !tx.state.is_pending();
 
                 if inserted_tx_id.eq(id) {
                     // if it is the new transaction, track its updated state
@@ -3356,6 +3363,49 @@ mod tests {
         let InsertOk { state, .. } =
             pool.insert_tx(f.validated(tx), on_chain_balance, on_chain_nonce).unwrap();
         assert!(state.contains(TxState::NOT_TOO_MUCH_GAS));
+    }
+
+    #[test]
+    fn gap_fill_rechecks_descendant_fee_eligibility() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = AllTransactions::default();
+        let sender = address!("0x000000000000000000000000000000000000000d");
+        let balance = U256::MAX;
+
+        pool.pending_fees.base_fee = 100;
+        let descendant = MockTransaction::eip1559()
+            .with_sender(sender)
+            .with_nonce(1)
+            .with_gas_limit(21_000)
+            .with_max_fee(150)
+            .with_priority_fee(1)
+            .rng_hash();
+        let descendant = f.validated(descendant);
+        let descendant_id = *descendant.id();
+        pool.insert_tx(descendant, balance, 0).unwrap();
+        pool.update(&Default::default());
+
+        // The fee increase cannot affect a nonce-gapped transaction yet, but closing its gap must
+        // evaluate it against the current fee.
+        pool.pending_fees.base_fee = 200;
+        pool.update(&Default::default());
+        assert!(pool.get(&descendant_id).unwrap().state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+
+        let predecessor = MockTransaction::eip1559()
+            .with_sender(sender)
+            .with_nonce(0)
+            .with_gas_limit(21_000)
+            .with_max_fee(250)
+            .with_priority_fee(1)
+            .rng_hash();
+        let InsertOk { move_to, .. } =
+            pool.insert_tx(f.validated(predecessor), balance, 0).unwrap();
+
+        assert_eq!(move_to, SubPool::Pending);
+        let descendant = pool.get(&descendant_id).unwrap();
+        assert_eq!(descendant.subpool, SubPool::BaseFee);
+        assert!(!descendant.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+        assert!(descendant.state.contains(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK));
     }
 
     #[test]
